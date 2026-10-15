@@ -532,8 +532,10 @@ void getAircraftModel(Aircraft& a) {
     char mf[24], ty[28];
     copyAscii(mf, ac["manufacturer"] | "", sizeof(mf));
     copyAscii(ty, ac["type"] | "", sizeof(ty));
-    if (mf[0] && strncasecmp(ty, mf, strlen(mf)) != 0) snprintf(c.model, sizeof(c.model), "%s %s", mf, ty);
-    else snprintf(c.model, sizeof(c.model), "%s", ty);
+    char full[56];   // intentionally larger than c.model; shortened by copyAscii
+    if (mf[0] && strncasecmp(ty, mf, strlen(mf)) != 0) snprintf(full, sizeof(full), "%s %s", mf, ty);
+    else snprintf(full, sizeof(full), "%s", ty);
+    copyAscii(c.model, full, sizeof(c.model));
     copyAscii(c.owner, ac["registered_owner"] | "", sizeof(c.owner));
   }
   strcpy(a.model, c.model);
