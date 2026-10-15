@@ -12,6 +12,7 @@ A real-time aircraft tracker for the **ESP32 Cheap Yellow Display (CYD)** that r
 - **WiFi setup portal** — no credentials in code needed: on first boot (or when the saved network is unreachable) the device opens a `PlaneSpotter-Setup` hotspot where you pick your network and enter your city from a phone.
 - **Web Configuration** — built-in web server with a city search, plus home location, search radius, radar range and a "Forget WiFi" button, from any browser on the same network.
 - **Dual-core architecture** — all HTTP/API calls (aircraft, routes, weather) run on Core 0 in a FreeRTOS task; UI rendering and touch handling run on Core 1, keeping the display smooth.
+- **Back RGB LED alerts** — the LED on the back of the board can glow green/yellow/red by distance to the nearest aircraft, and/or blink when a special aircraft comes within the alert range: helicopters (blue), military (magenta), government/rare aircraft (orange), low-flying aircraft (cyan), or anything on your own watch list of type codes and callsign prefixes (white). Each aircraft blinks once, then the LED glows steadily while it stays in range.
 - **Imperial or metric units** — miles/°F/mph by default, switchable to km/°C/km/h.
 
 ## Hardware
@@ -24,6 +25,7 @@ Both CYD variants are supported — pick the matching PlatformIO environment:
 | ESP32-2432S028R "CYD2USB" | micro-USB **and** USB-C | ST7789 | `cyd2usb` |
 
 - **Touch**: XPT2046 resistive touch controller
+- **RGB LED** (back side): red GPIO4, green GPIO16, blue GPIO17, active LOW
 - **Display**: 240×320 pixels, rotation 1 (landscape)
 
 If the screen is white or the colors look inverted, try the other environment; if colors are still inverted, add `-D DISPLAY_INVERT=1` to that environment's `build_flags`.
@@ -84,6 +86,7 @@ CYD28/
 - **On the Settings screen**: *WiFi setup* (tap twice to confirm) reopens the setup portal to switch networks; *Locate by IP* sets an approximate location automatically.
 - **Changing networks from the browser**: *Forget WiFi & restart* on the web page erases the saved network and reboots into the setup portal. (Credentials hard-coded in `config.env` are always tried first.)
 - **On the Radar screen**, tap the **−/+ buttons** at the bottom-left to adjust range (5–150 mi in 5 mi steps, or 10–250 km when metric).
+- **Back LED** settings are on the web page: distance colors, which aircraft trigger a blink, the alert range, the watch list (e.g. `B52, C17, A388, N911`) and brightness, plus a *Test LED* button. The last alert is shown on the Settings screen.
 - **Open the device IP** in a browser to search for your city, or set coordinates, search radius (nautical miles, up to 250) and radar range by hand.
 
 Aircraft on the ground are hidden, so taxiing traffic at a nearby airport doesn't crowd the screen.

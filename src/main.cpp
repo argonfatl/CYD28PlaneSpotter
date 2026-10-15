@@ -80,12 +80,14 @@
   #define WIND_UNIT "mph"
   static const double KM_PER_UNIT = 1.609344;
   static const float  RANGE_STEP = 5, RANGE_MIN = 5, RANGE_MAX = 150;
+  static const float  DEFAULT_ALERT_RANGE = 3;
 #else
   #define DIST_UNIT "km"
   #define TEMP_UNIT "C"
   #define WIND_UNIT "km/h"
   static const double KM_PER_UNIT = 1.0;
   static const float  RANGE_STEP = 10, RANGE_MIN = 10, RANGE_MAX = 250;
+  static const float  DEFAULT_ALERT_RANGE = 5;
 #endif
 static const float MAX_SEARCH_NM = 250;   // airplanes.live point-query limit
 
@@ -102,6 +104,48 @@ SemaphoreHandle_t configMutex = NULL;  // protects homeLat/Lon/Name/searchRadius
 volatile bool refreshRequested = false;   // skip the rest of the poll wait
 volatile bool ipLocateRequested = false;  // "Locate by IP" button
 char statusMsg[48] = "";                  // one-line feedback on the settings screen
+
+// ---- Back RGB LED (CYD: R=GPIO4, G=GPIO16, B=GPIO17, common anode = active LOW) ----
+#define LED_PIN_R 4
+#define LED_PIN_G 16
+#define LED_PIN_B 17
+#define LED_CH_R 1
+#define LED_CH_G 2
+#define LED_CH_B 3
+
+struct LedConfig {                 // protected by configMutex, persisted in NVS
+  bool proximity = false;          // color by distance to the nearest aircraft
+  bool alerts = true;              // blink when a special aircraft comes within alertRange
+  bool heli = true;                // trigger: rotorcraft (ADS-B category A7)
+  bool military = true;            // trigger: military (database flag)
+  bool interesting = false;        // trigger: "interesting" (government, rare, etc.)
+  int  lowAltFt = 0;               // trigger: below this altitude, 0 = off
+  float alertRange = DEFAULT_ALERT_RANGE;  // display units
+  uint8_t brightness = 40;         // percent
+  char watch[96] = "";             // comma-separated type codes / callsign prefixes
+} ledCfg;
+
+enum AlertKind : uint8_t { ALERT_NONE, ALERT_LOWALT, ALERT_HELI, ALERT_INTERESTING, ALERT_MILITARY, ALERT_WATCH };
+struct AlertInfo {
+  AlertKind kind = ALERT_NONE;
+  char callsign[10] = ""; char type[6] = "";
+  double distKm = 0;
+};
+AlertInfo currentAlert;            // highest-priority alert in range now (dataMutex)
+AlertInfo lastAlert;               // most recent alert, for the settings screen (dataMutex)
+uint32_t lastAlertMs = 0;
+volatile bool ledTestRequested = false;
+
+const char* alertName(AlertKind k) {
+  switch (k) {
+    case ALERT_WATCH: return "WATCH";
+    case ALERT_MILITARY: return "MIL";
+    case ALERT_INTERESTING: return "SPECIAL";
+    case ALERT_HELI: return "HELI";
+    case ALERT_LOWALT: return "LOW";
+    default: return "";
+  }
+}
 WebServer server(80);
 Preferences prefs;
 // =======================================================================
@@ -124,6 +168,7 @@ struct Aircraft {
   char callsign[10]; char type[6]; char reg[10]; char airline[28];
   double lat; double lon; int altFt; float gsKt;
   float trackDeg; int vrateFpm; bool onGround;
+  char category[3]; uint8_t dbFlags;   // ADS-B emitter category ("A7" = rotorcraft); bit0 military, bit1 interesting
   double distanceKm; double bearingDeg; bool valid;
   char dep[5]; char arr[5]; bool hasRoute;
 };
@@ -403,14 +448,52 @@ bool getRoute(Aircraft& a) {
   return a.dep[0] != '\0';
 }
 
+// Watch list: comma/space separated tokens; a token matches the ICAO type code
+// exactly (e.g. "B52") or the start of the callsign (e.g. "N911", "RCH")
+struct WatchList {
+  char tok[12][10]; int n = 0;
+  void parse(const char* s) {
+    n = 0;
+    while (*s && n < 12) {
+      while (*s == ',' || *s == ' ') s++;
+      int j = 0;
+      while (*s && *s != ',' && *s != ' ') { if (j < 9) tok[n][j++] = toupper(*s); s++; }
+      tok[n][j] = '\0';
+      if (j) n++;
+    }
+  }
+  bool match(const char* callsign, const char* type) const {
+    for (int i = 0; i < n; i++) {
+      if (type[0] && strcmp(type, tok[i]) == 0) return true;
+      if (strncmp(callsign, tok[i], strlen(tok[i])) == 0) return true;
+    }
+    return false;
+  }
+};
+
+AlertKind classifyAlert(const LedConfig& lc, const WatchList& wl, const char* cs, const char* type,
+                        const char* category, uint8_t dbFlags, int altFt) {
+  if (wl.match(cs, type)) return ALERT_WATCH;
+  if (lc.military && (dbFlags & 1)) return ALERT_MILITARY;
+  if (lc.interesting && (dbFlags & 2)) return ALERT_INTERESTING;
+  if (lc.heli && strcmp(category, "A7") == 0) return ALERT_HELI;
+  if (lc.lowAltFt > 0 && altFt < lc.lowAltFt) return ALERT_LOWALT;
+  return ALERT_NONE;
+}
+
 // Fetches aircraft data into caller-provided local buffers (thread-safe — no globals touched)
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
-                     Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut) {
+                     Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut,
+                     AlertInfo& alertOut) {
   // Snapshot config under mutex (Core 0 reads, Core 1 may write via web UI)
-  double hLat, hLon; float sRadNm;
+  double hLat, hLon; float sRadNm; LedConfig lc;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-  hLat = homeLat; hLon = homeLon; sRadNm = searchRadiusNm;
+  hLat = homeLat; hLon = homeLon; sRadNm = searchRadiusNm; lc = ledCfg;
   if (configMutex) xSemaphoreGive(configMutex);
+
+  WatchList wl; wl.parse(lc.watch);
+  double alertKm = lc.alertRange * KM_PER_UNIT;
+  alertOut = AlertInfo();
 
   String url = "https://api.airplanes.live/v2/point/" + String(hLat, 4) + "/" +
                String(hLon, 4) + "/" + String((int)ceilf(sRadNm));
@@ -428,6 +511,8 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   filter["ac"][0]["track"]     = true;
   filter["ac"][0]["baro_rate"] = true;
   filter["ac"][0]["geom_rate"] = true;
+  filter["ac"][0]["category"]  = true;
+  filter["ac"][0]["dbFlags"]   = true;
 
   JsonDocument doc;
   if (httpGetJson(url, doc, &filter) != HTTP_CODE_OK) { stats.requestsFail++; return false; }
@@ -451,7 +536,21 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     char cs[10];
     copyAscii(cs, s["flight"] | "", sizeof(cs));
     if (cs[0] == '\0') copyAscii(cs, s["r"] | "", sizeof(cs));  // fall back to registration
+    char type[6], category[3];
+    copyAscii(type, s["t"] | "", sizeof(type));
+    copyAscii(category, s["category"] | "", sizeof(category));
+    uint8_t dbFlags = s["dbFlags"] | 0;
     count++;
+
+    // LED alerts: keep the highest-priority (then nearest) special aircraft in range
+    if (lc.alerts && d <= alertKm) {
+      AlertKind k = classifyAlert(lc, wl, cs, type, category, dbFlags, altFt);
+      if (k != ALERT_NONE && (k > alertOut.kind || (k == alertOut.kind && d < alertOut.distKm))) {
+        alertOut.kind = k; alertOut.distKm = d;
+        strcpy(alertOut.callsign, cs[0] ? cs : "?");
+        strcpy(alertOut.type, type);
+      }
+    }
 
     // Radar keeps the MAX_BLIPS nearest aircraft (replace the farthest when full)
     int slot = -1;
@@ -476,7 +575,9 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     a.hasRoute = false; a.dep[0] = a.arr[0] = a.airline[0] = '\0';
     a.valid = true;
     strcpy(a.callsign, cs[0] ? cs : "(no id)");
-    copyAscii(a.type, s["t"] | "", sizeof(a.type));
+    strcpy(a.type, type);
+    strcpy(a.category, category);
+    a.dbFlags = dbFlags;
     copyAscii(a.reg, s["r"] | "", sizeof(a.reg));
 
     int insertIdx = -1;
@@ -540,6 +641,7 @@ void dataFetcherTask(void* param) {
   uint8_t locTop5Count = 0;
   uint8_t locBlipCount = 0;
   Aircraft locNearest;
+  AlertInfo locAlert;
   locNearest.valid = false;
 
   uint32_t lastWeatherMs = 0;
@@ -569,7 +671,7 @@ void dataFetcherTask(void* param) {
         weatherDone = true;
       }
 
-      if (fetchAircraftTo(locTop5, locTop5Count, locNearest, locBlips, locBlipCount)) {
+      if (fetchAircraftTo(locTop5, locTop5Count, locNearest, locBlips, locBlipCount, locAlert)) {
         // Routes for the top 5 (cached, so usually no network call)
         for (int i = 0; i < locTop5Count; i++)
           locTop5[i].hasRoute = getRoute(locTop5[i]);
@@ -582,6 +684,8 @@ void dataFetcherTask(void* param) {
         memcpy(top5, locTop5, sizeof(locTop5));
         top5Count = locTop5Count;
         nearest = locNearest;
+        currentAlert = locAlert;
+        if (locAlert.kind != ALERT_NONE) { lastAlert = locAlert; lastAlertMs = millis(); }
         lastDataMs = millis();
         stats.lastUpdateMs = lastDataMs;
         newDataReady = true;
@@ -673,8 +777,9 @@ void screenTargetIntel(bool newPage) {
   tft.drawString(nearest.airline[0] ? nearest.airline : " ", 20, 68);
 
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  snprintf(buf, sizeof(buf), "Type: %s  Reg: %s",
-           nearest.type[0] ? nearest.type : "?", nearest.reg[0] ? nearest.reg : "?");
+  const char* tag = (nearest.dbFlags & 1) ? " MIL" : strcmp(nearest.category, "A7") == 0 ? " HELI" : "";
+  snprintf(buf, sizeof(buf), "Type: %s  Reg: %s%s",
+           nearest.type[0] ? nearest.type : "?", nearest.reg[0] ? nearest.reg : "?", tag);
   tft.drawString(buf, 20, 93);
 
   snprintf(buf, sizeof(buf), "Distance: %.1f %s (%s)",
@@ -950,8 +1055,25 @@ void screenSettings(bool newPage) {
   snprintf(buf, sizeof(buf), "%.4f, %.4f   search %d NM", hLat, hLon, (int)sRad);
   tft.drawString(buf, 10, 116);
 
+  // LED: last alert (if within 30 min), otherwise what the LED is set to do
+  bool ledAlerts, ledProx;
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  ledAlerts = ledCfg.alerts; ledProx = ledCfg.proximity;
+  if (configMutex) xSemaphoreGive(configMutex);
+  if (lastAlertMs && millis() - lastAlertMs < 30UL * 60 * 1000) {
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "Alert: %s %s %s %.1f%s, %lum ago",
+             alertName(lastAlert.kind), lastAlert.callsign, lastAlert.type,
+             toDisplayDist(lastAlert.distKm), DIST_UNIT, (millis() - lastAlertMs) / 60000UL);
+  } else {
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "LED: alerts %s, distance colors %s",
+             ledAlerts ? "on" : "off", ledProx ? "on" : "off");
+  }
+  tft.drawString(buf, 10, 138);
+
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString(statusMsg[0] ? statusMsg : " ", 10, 150);
+  tft.drawString(statusMsg[0] ? statusMsg : " ", 10, 160);
   tft.setTextPadding(0);
 
   // Buttons: redraw only when their state changes (avoids flicker)
@@ -990,6 +1112,113 @@ void render() {
     case 4: screenSettings(newPage);    break;
   }
   if (dataMutex) xSemaphoreGive(dataMutex);
+}
+
+// ---------------------------------------------------------------------------
+// Back RGB LED
+// ---------------------------------------------------------------------------
+struct RGB { uint8_t r, g, b; };
+
+RGB alertColor(AlertKind k) {
+  switch (k) {
+    case ALERT_WATCH:       return {255, 255, 255};  // white
+    case ALERT_MILITARY:    return {255, 0, 255};    // magenta
+    case ALERT_INTERESTING: return {255, 80, 0};     // orange
+    case ALERT_HELI:        return {0, 60, 255};     // blue
+    case ALERT_LOWALT:      return {0, 255, 200};    // cyan
+    default:                return {0, 0, 0};
+  }
+}
+
+void ledInit() {
+  ledcSetup(LED_CH_R, 5000, 8); ledcAttachPin(LED_PIN_R, LED_CH_R);
+  ledcSetup(LED_CH_G, 5000, 8); ledcAttachPin(LED_PIN_G, LED_CH_G);
+  ledcSetup(LED_CH_B, 5000, 8); ledcAttachPin(LED_PIN_B, LED_CH_B);
+  ledcWrite(LED_CH_R, 255); ledcWrite(LED_CH_G, 255); ledcWrite(LED_CH_B, 255);  // off (active LOW)
+}
+
+// level: extra dimming in percent on top of the configured brightness
+void ledSet(RGB c, uint8_t brightness, uint8_t level = 100) {
+  static RGB last = {1, 1, 1};
+  uint32_t k = (uint32_t)brightness * level;           // 0..10000
+  RGB v = { (uint8_t)(c.r * k / 10000), (uint8_t)(c.g * k / 10000), (uint8_t)(c.b * k / 10000) };
+  if (v.r == last.r && v.g == last.g && v.b == last.b) return;
+  last = v;
+  ledcWrite(LED_CH_R, 255 - v.r);
+  ledcWrite(LED_CH_G, 255 - v.g);
+  ledcWrite(LED_CH_B, 255 - v.b);
+}
+
+// Remembers which aircraft already triggered a blink, so each one blinks once
+bool alreadyAlerted(const char* callsign) {
+  struct Seen { char cs[10]; uint32_t ms; };
+  static Seen seen[16] = {};
+  const uint32_t FORGET_MS = 15UL * 60 * 1000;
+  int freeIdx = 0; uint32_t oldest = 0xFFFFFFFF;
+  for (int i = 0; i < 16; i++) {
+    if (seen[i].cs[0] && strcmp(seen[i].cs, callsign) == 0 && millis() - seen[i].ms < FORGET_MS) {
+      seen[i].ms = millis();
+      return true;
+    }
+    if (seen[i].ms < oldest) { oldest = seen[i].ms; freeIdx = i; }
+  }
+  strcpy(seen[freeIdx].cs, callsign);
+  seen[freeIdx].ms = millis();
+  return false;
+}
+
+// Called every loop on Core 1; non-blocking
+void ledUpdate() {
+  static uint32_t blinkUntil = 0, testUntil = 0;
+  static RGB blinkColor = {0, 0, 0};
+  uint32_t now = millis();
+
+  LedConfig lc;
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  lc = ledCfg;
+  if (configMutex) xSemaphoreGive(configMutex);
+
+  AlertInfo al; bool haveNearest; double nearestKm;
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+  al = currentAlert; haveNearest = nearest.valid; nearestKm = nearest.distanceKm;
+  if (dataMutex) xSemaphoreGive(dataMutex);
+
+  // "Test LED" from the web page: cycle through the alert colors for 3 s
+  if (ledTestRequested) { ledTestRequested = false; testUntil = now + 3000; }
+  if ((int32_t)(testUntil - now) > 0) {
+    static const RGB cycle[] = {{255,0,0},{0,255,0},{0,60,255},{255,0,255},{255,255,255}};
+    ledSet(cycle[(now / 300) % 5], lc.brightness);
+    return;
+  }
+
+  // New special aircraft in range -> blink 8 times in its color
+  if (lc.alerts && al.kind != ALERT_NONE && !alreadyAlerted(al.callsign)) {
+    blinkUntil = now + 8 * 2 * 150;
+    blinkColor = alertColor(al.kind);
+    Serial.printf("LED alert: %s %s %s %.1f km\n", alertName(al.kind), al.callsign, al.type, al.distKm);
+  }
+  if ((int32_t)(blinkUntil - now) > 0) {
+    bool on = ((blinkUntil - now) / 150) % 2;
+    ledSet(on ? blinkColor : RGB{0, 0, 0}, lc.brightness);
+    return;
+  }
+
+  // While it stays in range: steady glow at half brightness
+  if (lc.alerts && al.kind != ALERT_NONE) {
+    ledSet(alertColor(al.kind), lc.brightness, 50);
+    return;
+  }
+
+  // Proximity colors: red inside the alert range, yellow up to 3x, green beyond
+  if (lc.proximity && haveNearest) {
+    double r = lc.alertRange * KM_PER_UNIT;
+    if (nearestKm <= r)          ledSet({255, 0, 0}, lc.brightness);
+    else if (nearestKm <= 3 * r) ledSet({255, 120, 0}, lc.brightness);
+    else                         ledSet({0, 255, 0}, lc.brightness, 40);
+    return;
+  }
+
+  ledSet({0, 0, 0}, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,10 +1379,12 @@ void checkTouch() {
 void initWebServer() {
   // GET / — serve config page
   server.on("/", []() {
-    double hLat, hLon; float sRad, rRange; String name;
+    double hLat, hLon; float sRad, rRange; String name; LedConfig lc;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     hLat = homeLat; hLon = homeLon; sRad = searchRadiusNm; rRange = radarRange; name = homeName;
+    lc = ledCfg;
     if (configMutex) xSemaphoreGive(configMutex);
+    auto chk = [](bool b) { return b ? String(" checked") : String(""); };
     name.replace("&", "&amp;"); name.replace("\"", "&quot;"); name.replace("<", "&lt;");
     String ssid = WiFi.SSID();
     ssid.replace("&", "&amp;"); ssid.replace("<", "&lt;");
@@ -1177,8 +1408,13 @@ void initWebServer() {
   .opt:hover{background:#22223a}
   .danger{background:#3a1a1a;color:#ff8080}.danger:hover{background:#552222}
   .info{text-align:center;color:#666;font-size:0.8em;margin-top:12px}
-  .msg{color:#00ff88;text-align:center;display:none;margin-top:8px}
+  .msg{color:#00ff88;text-align:center;display:none;position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#1a1a2e;border:1px solid #00ff88;padding:10px 18px;border-radius:8px}
   #res{font-size:0.9em;color:#aaa;margin-top:6px}
+  .chk{display:flex;align-items:center;gap:10px;margin:10px 0;color:#e0e0e0;font-size:0.95em}
+  .chk input{width:auto;margin:0}
+  .sub{margin-left:26px}
+  .hint{color:#777;font-size:0.8em;margin-top:4px}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-left:4px}
 </style></head><body>
 <h1>&#9992; CYD Plane Spotter</h1>
 <div class="card">
@@ -1201,6 +1437,28 @@ void initWebServer() {
     <button type="submit">Save Settings</button>
   </form>
   <div class="msg" id="msg"></div>
+</div>
+<div class="card">
+  <h2>Back LED</h2>
+  <label class="chk"><input type="checkbox" id="lp")rawliteral" + chk(lc.proximity) + R"rawliteral(> Color by distance to nearest aircraft</label>
+  <div class="hint sub">green = far, yellow = within 3&times; alert range, red = within alert range</div>
+  <label class="chk"><input type="checkbox" id="la")rawliteral" + chk(lc.alerts) + R"rawliteral(> Blink when a special aircraft comes close</label>
+  <div class="sub">
+    <label class="chk"><input type="checkbox" id="th")rawliteral" + chk(lc.heli) + R"rawliteral(> Helicopters <span class="dot" style="background:#0040ff"></span></label>
+    <label class="chk"><input type="checkbox" id="tm")rawliteral" + chk(lc.military) + R"rawliteral(> Military <span class="dot" style="background:#ff00ff"></span></label>
+    <label class="chk"><input type="checkbox" id="ti")rawliteral" + chk(lc.interesting) + R"rawliteral(> Government / rare aircraft <span class="dot" style="background:#ff5000"></span></label>
+    <label>Low altitude below (ft, 0 = off) <span class="dot" style="background:#00ffc8"></span></label>
+    <input type="number" step="100" min="0" max="20000" id="tl" value=")rawliteral" + String(lc.lowAltFt) + R"rawliteral(">
+    <label>Watch list <span class="dot" style="background:#fff"></span></label>
+    <input id="tw" maxlength="95" placeholder="e.g. B52, C17, A388, N911" value=")rawliteral" + String(lc.watch) + R"rawliteral(">
+    <div class="hint">Aircraft type codes, or the start of a callsign / registration</div>
+  </div>
+  <label>Alert range ()rawliteral" + String(DIST_UNIT) + R"rawliteral()</label>
+  <input type="number" step="0.5" min="0.5" max="50" id="lr" value=")rawliteral" + String(lc.alertRange, 1) + R"rawliteral(">
+  <label>Brightness</label>
+  <input type="range" min="5" max="100" id="lb" value=")rawliteral" + String(lc.brightness) + R"rawliteral(" style="padding:0">
+  <button type="button" onclick="saveLed()">Save LED Settings</button>
+  <button type="button" class="opt" style="text-align:center" onclick="post('/led-test','')">Test LED</button>
 </div>
 <div class="card">
   <h2>WiFi</h2>
@@ -1232,6 +1490,18 @@ function save(e){
   x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
   x.onload=function(){flash(x.status==200?'✓ Settings saved!':x.responseText)};
   x.send(['name','lat','lon','radius','range'].map(function(k){return k+'='+encodeURIComponent($(k).value)}).join('&'));
+}
+function post(u,body,cb){
+  var x=new XMLHttpRequest();x.open('POST',u,true);
+  x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
+  x.onload=function(){if(cb)cb(x)};x.send(body);
+}
+function saveLed(){
+  var b=function(i){return $(i).checked?'1':'0'};
+  var body='lp='+b('lp')+'&la='+b('la')+'&th='+b('th')+'&tm='+b('tm')+'&ti='+b('ti')+
+    '&tl='+encodeURIComponent($('tl').value)+'&tw='+encodeURIComponent($('tw').value)+
+    '&lr='+encodeURIComponent($('lr').value)+'&lb='+encodeURIComponent($('lb').value);
+  post('/led',body,function(x){flash(x.status==200?'✓ LED settings saved!':x.responseText)});
 }
 function forget(){
   if(!confirm('Forget the saved WiFi network and restart into setup mode?'))return;
@@ -1291,6 +1561,54 @@ function forget(){
     server.send(200, "text/plain", "OK");
   });
 
+  // POST /led — back LED settings
+  server.on("/led", HTTP_POST, []() {
+    LedConfig n;
+    n.proximity   = server.arg("lp") == "1";
+    n.alerts      = server.arg("la") == "1";
+    n.heli        = server.arg("th") == "1";
+    n.military    = server.arg("tm") == "1";
+    n.interesting = server.arg("ti") == "1";
+    n.lowAltFt    = server.arg("tl").toInt();
+    n.alertRange  = server.arg("lr").toFloat();
+    int bright    = server.arg("lb").toInt();
+    if (n.lowAltFt < 0 || n.lowAltFt > 20000 || n.alertRange < 0.5f || n.alertRange > 50 ||
+        bright < 5 || bright > 100) {
+      server.send(400, "text/plain", "Invalid values");
+      return;
+    }
+    n.brightness = (uint8_t)bright;
+    // Watch list: keep only A-Z, 0-9, comma and space
+    String w = server.arg("tw"); w.toUpperCase();
+    int j = 0;
+    for (unsigned i = 0; i < w.length() && j < (int)sizeof(n.watch) - 1; i++) {
+      char c = w[i];
+      if (isalnum((uint8_t)c) || c == ',' || c == ' ') n.watch[j++] = c;
+    }
+    n.watch[j] = '\0';
+
+    if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+    ledCfg = n;
+    prefs.putBool("led_prox", n.proximity);
+    prefs.putBool("led_alert", n.alerts);
+    prefs.putBool("led_heli", n.heli);
+    prefs.putBool("led_mil", n.military);
+    prefs.putBool("led_intr", n.interesting);
+    prefs.putInt("led_lowalt", n.lowAltFt);
+    prefs.putFloat("led_range", n.alertRange);
+    prefs.putUChar("led_bright", n.brightness);
+    prefs.putString("led_watch", n.watch);
+    if (configMutex) xSemaphoreGive(configMutex);
+    refreshRequested = true;   // re-evaluate alerts right away
+    server.send(200, "text/plain", "OK");
+  });
+
+  // POST /led-test — cycle the LED through its colors for 3 s
+  server.on("/led-test", HTTP_POST, []() {
+    ledTestRequested = true;
+    server.send(200, "text/plain", "OK");
+  });
+
   // POST /wifi-reset — forget saved WiFi and reboot into the setup portal
   server.on("/wifi-reset", HTTP_POST, []() {
     server.send(200, "text/plain", "OK");
@@ -1343,6 +1661,17 @@ void setup() {
   Serial.printf("Config loaded: %s lat=%.6f lon=%.6f radius=%.0f nm range=%.0f %s\n",
                 homeName, homeLat, homeLon, searchRadiusNm, radarRange, DIST_UNIT);
 
+  ledCfg.proximity   = prefs.getBool("led_prox", ledCfg.proximity);
+  ledCfg.alerts      = prefs.getBool("led_alert", ledCfg.alerts);
+  ledCfg.heli        = prefs.getBool("led_heli", ledCfg.heli);
+  ledCfg.military    = prefs.getBool("led_mil", ledCfg.military);
+  ledCfg.interesting = prefs.getBool("led_intr", ledCfg.interesting);
+  ledCfg.lowAltFt    = prefs.getInt("led_lowalt", ledCfg.lowAltFt);
+  ledCfg.alertRange  = prefs.getFloat("led_range", ledCfg.alertRange);
+  ledCfg.brightness  = prefs.getUChar("led_bright", ledCfg.brightness);
+  copyAscii(ledCfg.watch, prefs.getString("led_watch", "").c_str(), sizeof(ledCfg.watch));
+  ledInit();
+
   connectWiFiAtBoot();
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   setenv("TZ", TIMEZONE, 1); tzset();
@@ -1375,5 +1704,6 @@ void loop() {
   checkTouch();
   server.handleClient();
   render();
+  ledUpdate();
   delay(33);
 }
