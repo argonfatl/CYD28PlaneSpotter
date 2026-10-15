@@ -22,6 +22,7 @@
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <cydqr.h>
+#include <TJpg_Decoder.h>
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
@@ -185,8 +186,18 @@ struct Aircraft {
   char category[3]; uint8_t dbFlags;   // ADS-B emitter category ("A7" = rotorcraft); bit0 military, bit1 interesting
   double distanceKm; double bearingDeg; bool valid;
   char dep[5]; char arr[5]; bool hasRoute;
+  char hex[7];                          // ICAO 24-bit address, for model/photo lookups
+  char flightIata[9];                   // e.g. "UA1288"
+  char depCity[20]; char arrCity[20];
+  double depLat, depLon, arrLat, arrLon; bool hasCoords;
+  char model[32];                       // e.g. "Boeing 737-7V3" (nearest aircraft only)
 };
 Aircraft nearest;
+
+// Photo of the nearest aircraft (planespotters.net thumbnail), protected by dataMutex
+uint8_t* photoJpg = nullptr; size_t photoLen = 0;
+char photoCredit[28] = "";
+uint32_t photoVersion = 0;              // bumps when the photo changes, triggers a redraw
 
 // Top 5 Tracker
 const uint8_t MAX_TOP5 = 5;
@@ -210,6 +221,8 @@ const uint8_t ROUTE_CACHE_SIZE = 15;
 struct CachedRoute {
   char callsign[10];
   char dep[5]; char arr[5]; char airline[28];
+  char flightIata[9]; char depCity[20]; char arrCity[20];
+  double depLat, depLon, arrLat, arrLon; bool hasCoords;
   bool valid; uint32_t fetchTime;
 };
 CachedRoute routeCache[ROUTE_CACHE_SIZE];
@@ -422,43 +435,57 @@ bool applyLocationInput(const char* input) {
 }
 
 // Fills a.dep / a.arr / a.airline from adsbdb (cached). Returns true if a route is known.
+void routeToAircraft(const CachedRoute& c, Aircraft& a) {
+  strcpy(a.dep, c.dep); strcpy(a.arr, c.arr); strcpy(a.airline, c.airline);
+  strcpy(a.flightIata, c.flightIata); strcpy(a.depCity, c.depCity); strcpy(a.arrCity, c.arrCity);
+  a.depLat = c.depLat; a.depLon = c.depLon; a.arrLat = c.arrLat; a.arrLon = c.arrLon;
+  a.hasCoords = c.hasCoords;
+}
+
 bool getRoute(Aircraft& a) {
-  a.dep[0] = a.arr[0] = a.airline[0] = '\0';
+  CachedRoute r = {};
+  routeToAircraft(r, a);
   const char* cs = a.callsign;
   if (strlen(cs) < 3 || strcmp(cs, "(no id)") == 0) return false;
 
   for (int i = 0; i < ROUTE_CACHE_SIZE; i++) {
     if (routeCache[i].valid && strcmp(routeCache[i].callsign, cs) == 0) {
-      strcpy(a.dep, routeCache[i].dep);
-      strcpy(a.arr, routeCache[i].arr);
-      strcpy(a.airline, routeCache[i].airline);
+      routeToAircraft(routeCache[i], a);
       return a.dep[0] != '\0';
     }
   }
 
   JsonDocument filter;
-  filter["response"]["flightroute"]["airline"]["name"] = true;
-  filter["response"]["flightroute"]["origin"]["iata_code"] = true;
-  filter["response"]["flightroute"]["origin"]["icao_code"] = true;
-  filter["response"]["flightroute"]["destination"]["iata_code"] = true;
-  filter["response"]["flightroute"]["destination"]["icao_code"] = true;
+  JsonObject fr = filter["response"]["flightroute"].to<JsonObject>();
+  fr["callsign_iata"] = true;
+  fr["airline"]["name"] = true;
+  for (const char* end : {"origin", "destination"})
+    for (const char* f : {"iata_code", "icao_code", "municipality", "latitude", "longitude"})
+      fr[end][f] = true;
 
   JsonDocument d;
   int code = httpGetJson(String("https://api.adsbdb.com/v0/callsign/") + cs, d, &filter);
   if (code != HTTP_CODE_OK && code != HTTP_CODE_NOT_FOUND) return false;  // transient: don't cache
 
   if (code == HTTP_CODE_OK) {
-    JsonObject r = d["response"]["flightroute"];
-    if (!r.isNull()) {
-      const char* o = r["origin"]["iata_code"] | "";
-      if (!o[0]) o = r["origin"]["icao_code"] | "";
-      const char* t = r["destination"]["iata_code"] | "";
-      if (!t[0]) t = r["destination"]["icao_code"] | "";
-      if (o[0] && t[0]) {
-        copyAscii(a.dep, o, sizeof(a.dep));
-        copyAscii(a.arr, t, sizeof(a.arr));
+    JsonObject f = d["response"]["flightroute"];
+    if (!f.isNull()) {
+      JsonObject o = f["origin"], t = f["destination"];
+      const char* oc = o["iata_code"] | ""; if (!oc[0]) oc = o["icao_code"] | "";
+      const char* tc = t["iata_code"] | ""; if (!tc[0]) tc = t["icao_code"] | "";
+      if (oc[0] && tc[0]) {
+        copyAscii(r.dep, oc, sizeof(r.dep));
+        copyAscii(r.arr, tc, sizeof(r.arr));
+        copyAscii(r.depCity, o["municipality"] | "", sizeof(r.depCity));
+        copyAscii(r.arrCity, t["municipality"] | "", sizeof(r.arrCity));
+        if (o["latitude"].is<double>() && t["latitude"].is<double>()) {
+          r.depLat = o["latitude"]; r.depLon = o["longitude"];
+          r.arrLat = t["latitude"]; r.arrLon = t["longitude"];
+          r.hasCoords = true;
+        }
       }
-      copyAscii(a.airline, r["airline"]["name"] | "", sizeof(a.airline));
+      copyAscii(r.airline, f["airline"]["name"] | "", sizeof(r.airline));
+      copyAscii(r.flightIata, f["callsign_iata"] | "", sizeof(r.flightIata));
     }
   }
 
@@ -469,15 +496,105 @@ bool getRoute(Aircraft& a) {
     if (!routeCache[i].valid) { replaceIdx = i; break; }
     if (routeCache[i].fetchTime < oldest) { oldest = routeCache[i].fetchTime; replaceIdx = i; }
   }
-  CachedRoute& c = routeCache[replaceIdx];
-  c.valid = true;
-  strcpy(c.callsign, cs);
-  strcpy(c.dep, a.dep);
-  strcpy(c.arr, a.arr);
-  strcpy(c.airline, a.airline);
-  c.fetchTime = millis();
-
+  strcpy(r.callsign, cs);
+  r.valid = true;
+  r.fetchTime = millis();
+  routeCache[replaceIdx] = r;
+  routeToAircraft(r, a);
   return a.dep[0] != '\0';
+}
+
+// Full aircraft model ("Boeing 737-7V3") and owner from adsbdb, by ICAO hex (small cache)
+void getAircraftModel(Aircraft& a) {
+  struct ModelCache { char hex[7]; char model[32]; char owner[28]; };
+  static ModelCache cache[8] = {};
+  static int next = 0;
+  a.model[0] = '\0';
+  if (!a.hex[0]) return;
+  for (auto& c : cache) {
+    if (strcmp(c.hex, a.hex) == 0) {
+      strcpy(a.model, c.model);
+      if (!a.airline[0]) strcpy(a.airline, c.owner);
+      return;
+    }
+  }
+  JsonDocument filter;
+  for (const char* f : {"manufacturer", "type", "registered_owner"})
+    filter["response"]["aircraft"][f] = true;
+  JsonDocument d;
+  int code = httpGetJson(String("https://api.adsbdb.com/v0/aircraft/") + a.hex, d, &filter);
+  if (code != HTTP_CODE_OK && code != HTTP_CODE_NOT_FOUND) return;   // transient: retry later
+
+  ModelCache& c = cache[next]; next = (next + 1) % 8;
+  strcpy(c.hex, a.hex); c.model[0] = c.owner[0] = '\0';
+  JsonObject ac = d["response"]["aircraft"];
+  if (code == HTTP_CODE_OK && !ac.isNull()) {
+    char mf[24], ty[28];
+    copyAscii(mf, ac["manufacturer"] | "", sizeof(mf));
+    copyAscii(ty, ac["type"] | "", sizeof(ty));
+    if (mf[0] && strncasecmp(ty, mf, strlen(mf)) != 0) snprintf(c.model, sizeof(c.model), "%s %s", mf, ty);
+    else snprintf(c.model, sizeof(c.model), "%s", ty);
+    copyAscii(c.owner, ac["registered_owner"] | "", sizeof(c.owner));
+  }
+  strcpy(a.model, c.model);
+  if (!a.airline[0]) strcpy(a.airline, c.owner);
+}
+
+// GET a URL into a newly allocated buffer (caller frees). Returns length, 0 on failure.
+size_t httpGetBytes(const String& url, uint8_t** out, size_t maxLen) {
+  *out = nullptr;
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setTimeout(15000);
+  http.setUserAgent("CYD28PlaneSpotter/1.2 (+https://github.com/argonfatl/CYD28PlaneSpotter)");
+  if (!http.begin(client, url)) return 0;
+  int code = http.GET();
+  int size = http.getSize();
+  if (code != HTTP_CODE_OK || size <= 0 || (size_t)size > maxLen) {
+    Serial.printf("Photo download: HTTP %d, size %d\n", code, size);
+    http.end(); return 0;
+  }
+  uint8_t* buf = (uint8_t*)malloc(size);
+  if (!buf) { http.end(); return 0; }
+  WiFiClient* st = http.getStreamPtr();
+  size_t got = 0; uint32_t t0 = millis();
+  while (got < (size_t)size && millis() - t0 < 15000) {
+    int n = st->read(buf + got, size - got);
+    if (n > 0) got += n; else delay(5);
+  }
+  http.end();
+  if (got != (size_t)size) { free(buf); return 0; }
+  *out = buf;
+  return got;
+}
+
+// Fetch a photo of the aircraft from planespotters.net and publish it for the screen
+void updatePhoto(const char* hex) {
+  static char lastHex[7] = "";
+  if (!hex[0] || strcmp(hex, lastHex) == 0) return;
+  strcpy(lastHex, hex);
+
+  uint8_t* jpg = nullptr; size_t len = 0; char credit[28] = "";
+  JsonDocument filter;
+  filter["photos"][0]["thumbnail"]["src"] = true;
+  filter["photos"][0]["photographer"] = true;
+  JsonDocument d;
+  if (httpGetJson(String("https://api.planespotters.net/pub/photos/hex/") + hex, d, &filter) == HTTP_CODE_OK) {
+    const char* src = d["photos"][0]["thumbnail"]["src"] | "";
+    if (src[0]) {
+      len = httpGetBytes(src, &jpg, 24 * 1024);
+      const char* who = d["photos"][0]["photographer"] | "";
+      if (who[0]) snprintf(credit, sizeof(credit), "(c) %s", who);
+    }
+  }
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  free(photoJpg);
+  photoJpg = jpg; photoLen = len;
+  copyAscii(photoCredit, credit, sizeof(photoCredit));
+  photoVersion++;
+  xSemaphoreGive(dataMutex);
+  Serial.printf("Photo %s: %u bytes %s\n", hex, (unsigned)len, credit);
 }
 
 // Aircraft data sources (all free, keyless, readsb JSON format), tried in order
@@ -549,7 +666,7 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   JsonDocument filter;
   for (const char* key : {"ac", "aircraft"}) {
     JsonObject f = filter[key].add<JsonObject>();
-    for (const char* fld : {"flight", "r", "t", "lat", "lon", "alt_baro", "alt_geom", "gs",
+    for (const char* fld : {"hex", "flight", "r", "t", "lat", "lon", "alt_baro", "alt_geom", "gs",
                             "track", "baro_rate", "geom_rate", "category", "dbFlags"})
       f[fld] = true;
   }
@@ -635,6 +752,9 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     a.valid = true;
     strcpy(a.callsign, cs[0] ? cs : "(no id)");
     strcpy(a.type, type);
+    copyAscii(a.hex, s["hex"] | "", sizeof(a.hex));
+    a.flightIata[0] = a.depCity[0] = a.arrCity[0] = a.model[0] = '\0';
+    a.hasCoords = false;
     strcpy(a.category, category);
     a.dbFlags = dbFlags;
     copyAscii(a.reg, s["r"] | "", sizeof(a.reg));
@@ -735,7 +855,7 @@ void dataFetcherTask(void* param) {
         // Routes for the top 5 (cached, so usually no network call)
         for (int i = 0; i < locTop5Count; i++)
           locTop5[i].hasRoute = getRoute(locTop5[i]);
-        if (locTop5Count > 0) locNearest = locTop5[0];
+        if (locTop5Count > 0) { getAircraftModel(locTop5[0]); locNearest = locTop5[0]; }
 
         // Atomically publish results to the globals used by render()
         xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -750,6 +870,9 @@ void dataFetcherTask(void* param) {
         stats.lastUpdateMs = lastDataMs;
         newDataReady = true;
         xSemaphoreGive(dataMutex);
+
+        // Photo of the nearest aircraft (only re-fetched when the target changes)
+        if (locNearest.valid) updatePhoto(locNearest.hex);
       }
     }
 
@@ -801,71 +924,212 @@ void drawArrow(int cx, int cy, int r, double angleDeg, uint16_t color) {
   tft.drawLine(tx, ty, tx + (int)(sin(right)* (r/2)), ty - (int)(cos(right)* (r/2)), color);
 }
 
+// ---- Target Intel: flight card (callsign, route progress, photo) ----
+#define C_BAND   0x2124   // #262626 top band
+#define C_PANEL  0x18E3   // #1C1C1C cards
+#define C_TRACK  0x39C7   // #3A3A3A progress track
+#define C_GOLD   0xF5C8   // #F0B840 callsign / progress
+#define C_BADGE  0x5ACB   // #5A5A5A grey badge
+#define C_BLUEB  0x328D   // #34506E blue badge
+#define C_LABEL  0x9CF3   // #9C9C9C labels
+
+// Photo box (top right of the band)
+const int PH_X = 216, PH_Y = 27, PH_W = 100, PH_H = 67;
+
+bool jpgToTft(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  tft.pushImage(x, y, w, h, bitmap);   // clipped by the viewport set around the photo box
+  return true;
+}
+
+// Text that fits in maxW pixels (font must be set), shortened with "."
+String fitPx(const char* s, int maxW) {
+  String t(s);
+  if (tft.textWidth(t) <= maxW) return t;
+  while (t.length() > 1 && tft.textWidth(t + ".") > maxW) t.remove(t.length() - 1);
+  return t + ".";
+}
+
+String withCommas(int v) {
+  char b[16]; snprintf(b, sizeof(b), "%d", abs(v));
+  String s(b), out;
+  int n = s.length();
+  for (int i = 0; i < n; i++) { out += s[i]; if ((n - i - 1) % 3 == 0 && i < n - 1) out += ','; }
+  return v < 0 ? "-" + out : out;
+}
+
+// Small airplane silhouette, nose pointing along angleDeg (0 = right, + = nose down)
+void drawPlaneGlyph(int cx, int cy, float sc, float angleDeg, uint16_t color) {
+  static const float tri[][6] = {
+    {-0.9f,-0.11f,  0.85f,-0.11f, 0.85f, 0.11f}, {-0.9f,-0.11f, 0.85f, 0.11f,-0.9f, 0.11f},  // fuselage
+    { 0.85f,-0.11f, 1.1f, 0.0f,   0.85f, 0.11f},                                           // nose
+    { 0.3f, 0.0f,  -0.25f,-0.95f,-0.3f, 0.0f}, { 0.3f, 0.0f, -0.25f, 0.95f,-0.3f, 0.0f},   // wings
+    {-0.65f,0.0f,  -1.0f,-0.45f, -0.95f,0.0f}, {-0.65f,0.0f, -1.0f, 0.45f,-0.95f,0.0f},   // tail
+  };
+  float a = angleDeg * PI / 180.0f, ca = cosf(a), sa = sinf(a);
+  for (auto& t : tri) {
+    int p[6];
+    for (int k = 0; k < 3; k++) {
+      float x = t[2*k], y = t[2*k+1];
+      p[2*k]   = cx + (int)lroundf(sc * (x * ca - y * sa));
+      p[2*k+1] = cy + (int)lroundf(sc * (x * sa + y * ca));
+    }
+    tft.fillTriangle(p[0], p[1], p[2], p[3], p[4], p[5], color);
+  }
+}
+
+// Rounded badge with centered text (font 2); returns its width
+int drawBadge(int x, int y, const char* text, uint16_t bg) {
+  tft.setTextFont(2);
+  int w = tft.textWidth(text) + 10;
+  tft.fillRoundRect(x, y, w, 20, 4, bg);
+  tft.setTextColor(TFT_WHITE, bg);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString(text, x + 5, y + 10);
+  tft.setTextDatum(TL_DATUM);
+  return w;
+}
+
+void drawPhotoBox() {
+  if (photoJpg && photoLen) {
+    uint16_t w = 0, h = 0;
+    TJpgDec.getJpgSize(&w, &h, photoJpg, photoLen);
+    uint8_t scale = 1;
+    while (scale < 8 && (w / scale > PH_W + 20 || h / scale > PH_H + 14)) scale *= 2;
+    TJpgDec.setJpgScale(scale);
+    tft.setViewport(PH_X, PH_Y, PH_W, PH_H);    // clip to the box; coordinates become relative
+    tft.fillScreen(C_BAND);
+    TJpgDec.drawJpg((PH_W - (int)(w / scale)) / 2, (PH_H - (int)(h / scale)) / 2, photoJpg, photoLen);
+    tft.resetViewport();
+    if (photoCredit[0]) {
+      tft.fillRect(PH_X, PH_Y + PH_H - 11, PH_W, 11, C_BLUEB);
+      tft.setTextFont(1); tft.setTextColor(TFT_WHITE, C_BLUEB);
+      tft.drawString(fitPx(photoCredit, PH_W - 4), PH_X + 2, PH_Y + PH_H - 10);
+    }
+  } else {
+    tft.fillRoundRect(PH_X, PH_Y, PH_W, PH_H, 4, C_PANEL);
+    drawPlaneGlyph(PH_X + PH_W / 2, PH_Y + PH_H / 2, 30, -15, C_TRACK);
+  }
+}
+
 void screenTargetIntel(bool newPage) {
   drawHeader("TARGET INTEL", newPage);
 
+  // Redraw the card only when the data or the photo changes (no flicker)
+  static uint32_t drawnData = 0, drawnPhoto = 0;
+  static bool drawnValid = false;
+  if (!newPage && drawnData == lastDataMs && drawnPhoto == photoVersion && drawnValid == nearest.valid) return;
+  drawnData = lastDataMs; drawnPhoto = photoVersion; drawnValid = nearest.valid;
+
+  tft.setTextPadding(0);
+  tft.setTextDatum(TL_DATUM);
+  tft.fillRect(0, 26, 320, 214, TFT_BLACK);
+
   if (!nearest.valid) {
-    tft.setTextPadding(300);
     tft.setTextFont(4);
     tft.setTextColor(TFT_RED, TFT_BLACK);
     tft.drawString("NO TARGET IN RANGE", 40, 100);
-    tft.setTextPadding(0);
     return;
   }
+  const Aircraft& a = nearest;
+  char buf[48];
 
-  tft.setTextPadding(140);
-  tft.setTextFont(4);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString(nearest.callsign, 20, 36);
+  // --- Top band: callsign + badges, airline, distance from you; photo on the right ---
+  tft.fillRect(0, 26, 320, 70, C_BAND);
+  tft.setTextFont(4); tft.setTextColor(C_GOLD, C_BAND);
+  tft.drawString(a.callsign, 6, 30);
+  int bx = 6 + tft.textWidth(a.callsign) + 6;
+  if (a.flightIata[0] && strcmp(a.flightIata, a.callsign) != 0) {
+    tft.setTextFont(2);
+    if (bx + tft.textWidth(a.flightIata) + 10 <= PH_X - 4) bx += drawBadge(bx, 32, a.flightIata, C_BADGE) + 4;
+  }
+  const char* tag = (a.dbFlags & 1) ? "MIL" : strcmp(a.category, "A7") == 0 ? "HELI" : a.type;
+  if (tag[0]) {
+    tft.setTextFont(2);
+    if (bx + tft.textWidth(tag) + 10 <= PH_X - 4)
+      drawBadge(bx, 32, tag, (a.dbFlags & 1) ? 0x8000 : C_BLUEB);
+  }
+  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, C_BAND);
+  tft.drawString(fitPx(a.airline[0] ? a.airline : "Unknown operator", PH_X - 12), 6, 58);
+  tft.setTextColor(C_LABEL, C_BAND);
+  snprintf(buf, sizeof(buf), "%.1f %s %s of you  HDG %03.0f",
+           toDisplayDist(a.distanceKm), DIST_UNIT, compass(a.bearingDeg), a.trackDeg);
+  tft.drawString(fitPx(buf, PH_X - 12), 6, 76);
+  drawPhotoBox();
 
-  tft.setTextFont(2);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setTextPadding(150);
-  if (nearest.hasRoute) {
-    char rte[32]; snprintf(rte, sizeof(rte), "Route: %s -> %s", nearest.dep, nearest.arr);
-    tft.drawString(rte, 160, 42);
+  // --- Route card ---
+  const int RX = 4, RY = 100, RW = 208, RH = 76;
+  tft.fillRoundRect(RX, RY, RW, RH, 6, C_PANEL);
+  if (a.hasRoute) {
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextFont(4); tft.setTextColor(TFT_WHITE, C_PANEL);
+    tft.drawString(a.dep, RX + 44, RY + 6);
+    tft.drawString(a.arr, RX + RW - 44, RY + 6);
+    tft.setTextFont(1); tft.setTextColor(C_LABEL, C_PANEL);
+    String dc(a.depCity), ac(a.arrCity); dc.toUpperCase(); ac.toUpperCase();
+    tft.drawString(fitPx(dc.c_str(), 84), RX + 44, RY + 34);
+    tft.drawString(fitPx(ac.c_str(), 84), RX + RW - 44, RY + 34);
+    tft.setTextDatum(TL_DATUM);
+
+    // Plane icon: tilted by climb / descent
+    float tilt = a.vrateFpm <= -300 ? 20 : a.vrateFpm >= 300 ? -20 : 0;
+    tft.fillCircle(RX + RW / 2, RY + 18, 13, TFT_WHITE);
+    drawPlaneGlyph(RX + RW / 2, RY + 18, 9, tilt, C_GOLD);
+
+    // Progress along the great circle, time to go at current ground speed
+    const int PX = RX + 10, PY = RY + 47, PW = RW - 20;
+    tft.fillRoundRect(PX, PY, PW, 6, 3, C_TRACK);
+    if (a.hasCoords) {
+      double flown = haversineKm(a.depLat, a.depLon, a.lat, a.lon);
+      double left  = haversineKm(a.lat, a.lon, a.arrLat, a.arrLon);
+      float frac = (flown + left) > 1 ? (float)(flown / (flown + left)) : 0;
+      tft.fillRoundRect(PX, PY, max(6, (int)(PW * frac)), 6, 3, C_GOLD);
+      tft.setTextFont(2); tft.setTextColor(C_LABEL, C_PANEL);
+      snprintf(buf, sizeof(buf), "%s %s to go", withCommas((int)lround(toDisplayDist(left))).c_str(), DIST_UNIT);
+      tft.drawString(buf, PX, PY + 10);
+      if (a.gsKt > 60) {
+        int mins = (int)lround(left / (a.gsKt * 1.852) * 60.0);
+        snprintf(buf, sizeof(buf), "~%d:%02d", mins / 60, mins % 60);
+        tft.setTextDatum(TR_DATUM);
+        tft.drawString(buf, PX + PW, PY + 10);
+        tft.setTextDatum(TL_DATUM);
+      }
+    }
   } else {
-    tft.drawString("Route: Unknown", 160, 42);
+    tft.setTextFont(2); tft.setTextColor(C_LABEL, C_PANEL);
+    tft.drawString("Route unknown", RX + 12, RY + 12);
+    drawPlaneGlyph(RX + RW / 2, RY + 48, 18, 0, C_TRACK);
   }
 
-  // Text rows stop short of the heading arrow (x >= 215)
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextPadding(195);
-  char buf[64];
+  // --- Altitude / speed card ---
+  const int SX = 216, SW = 100;
+  tft.fillRoundRect(SX, RY, SW, RH, 6, C_PANEL);
+  tft.setTextFont(1); tft.setTextColor(C_LABEL, C_PANEL);
+  tft.drawString("ALTITUDE FT", SX + 7, RY + 6);
+  tft.drawString("SPEED KT", SX + 7, RY + 42);
+  if (a.vrateFpm <= -300) tft.fillTriangle(SX + 86, RY + 5, SX + 94, RY + 5, SX + 90, RY + 12, TFT_ORANGE);
+  else if (a.vrateFpm >= 300) tft.fillTriangle(SX + 86, RY + 12, SX + 94, RY + 12, SX + 90, RY + 5, TFT_GREEN);
+  tft.setTextFont(4); tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.drawString(withCommas(a.altFt), SX + 7, RY + 16);
+  tft.drawString(String((int)lround(a.gsKt)), SX + 7, RY + 52);
 
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString(nearest.airline[0] ? nearest.airline : " ", 20, 68);
+  // --- Aircraft model / registration ---
+  const int BY = 180, BH = 38;
+  tft.fillRoundRect(RX, BY, RW, BH, 6, C_PANEL);
+  tft.fillRoundRect(SX, BY, SW, BH, 6, C_PANEL);
+  tft.setTextFont(1); tft.setTextColor(C_LABEL, C_PANEL);
+  tft.drawString("AIRCRAFT", RX + 8, BY + 5);
+  tft.drawString("REG.", SX + 7, BY + 5);
+  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.drawString(fitPx(a.model[0] ? a.model : (a.type[0] ? a.type : "Unknown"), RW - 16), RX + 8, BY + 16);
+  tft.drawString(fitPx(a.reg[0] ? a.reg : "-", SW - 12), SX + 7, BY + 16);
 
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  const char* tag = (nearest.dbFlags & 1) ? " MIL" : strcmp(nearest.category, "A7") == 0 ? " HELI" : "";
-  snprintf(buf, sizeof(buf), "Type: %s  Reg: %s%s",
-           nearest.type[0] ? nearest.type : "?", nearest.reg[0] ? nearest.reg : "?", tag);
-  tft.drawString(buf, 20, 93);
-
-  snprintf(buf, sizeof(buf), "Distance: %.1f %s (%s)",
-           toDisplayDist(nearest.distanceKm), DIST_UNIT, compass(nearest.bearingDeg));
-  tft.drawString(buf, 20, 118);
-
-  if (nearest.vrateFpm >= 300 || nearest.vrateFpm <= -300)
-    snprintf(buf, sizeof(buf), "Alt: %d ft  %+d fpm", nearest.altFt, nearest.vrateFpm);
-  else
-    snprintf(buf, sizeof(buf), "Alt: %d ft (FL%03d)", nearest.altFt, (nearest.altFt + 50) / 100);
-  tft.drawString(buf, 20, 143);
-
-#if UNITS_IMPERIAL
-  snprintf(buf, sizeof(buf), "Speed: %.0f kt (%.0f mph)", nearest.gsKt, nearest.gsKt * 1.15078f);
-#else
-  snprintf(buf, sizeof(buf), "Speed: %.0f kt (%.0f km/h)", nearest.gsKt, nearest.gsKt * 1.852f);
-#endif
-  tft.drawString(buf, 20, 168);
-
-  tft.fillRect(220, 110, 60, 60, TFT_BLACK);
-  drawArrow(250, 140, 25, nearest.trackDeg, TFT_CYAN);
-  tft.setTextPadding(80);
-  snprintf(buf, sizeof(buf), "HDG %03.0f", nearest.trackDeg);
-  tft.drawString(buf, 225, 180);
-
-  tft.setTextPadding(0);
+  // Footer: vertical rate in words
+  if (a.vrateFpm >= 300 || a.vrateFpm <= -300) {
+    tft.setTextFont(1); tft.setTextColor(C_LABEL, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "%s %s fpm", a.vrateFpm > 0 ? "Climbing" : "Descending",
+             withCommas(abs(a.vrateFpm)).c_str());
+    tft.drawString(buf, RX + 4, 226);
+  }
 }
 
 void screenTop5(bool newPage) {
@@ -1906,6 +2170,9 @@ void setup() {
   radarSpr.setColorDepth(16);
   radarSpr.createSprite(200, 200);
 
+  TJpgDec.setSwapBytes(true);
+  TJpgDec.setCallback(jpgToTft);
+
   tft.fillScreen(TFT_BLACK);
   tft.setTextFont(4); tft.setTextColor(TFT_GREEN);
   tft.drawString("CYD PLANE SPOTTER", 20, 100);
@@ -1955,7 +2222,7 @@ void setup() {
   xTaskCreatePinnedToCore(
     dataFetcherTask,   // Function
     "DataFetch",       // Name
-    16384,             // Stack (16 KB — enough for JSON + SSL)
+    20480,             // Stack (20 KB — JSON + SSL + photo download)
     NULL,              // Parameter
     1,                 // Priority
     &fetchTaskHandle,  // Handle
