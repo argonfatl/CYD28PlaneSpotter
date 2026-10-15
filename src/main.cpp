@@ -1,7 +1,11 @@
 /*
  * CYD28 (ESP32) Plane Spotter - Direct TFT Rendering
  * --------------------------------------------------------------------------
- * UPDATE: Merged Weather & System Status into a single unified screen.
+ * Data sources (no API keys needed):
+ *   - airplanes.live  : live ADS-B aircraft around a point
+ *   - adsbdb.com      : callsign -> airline + route (origin/destination)
+ *   - Open-Meteo      : current weather
+ * All network I/O runs in a FreeRTOS task on Core 0; Core 1 only draws.
  */
 
 #include <WiFi.h>
@@ -25,14 +29,57 @@
 // =======================================================================
 #include "config.env"
 
+// Defaults for anything config.env doesn't define (keeps older configs building)
+#ifndef UNITS_IMPERIAL
+#define UNITS_IMPERIAL 1
+#endif
+#ifndef TIMEZONE
+#define TIMEZONE "CST6CDT,M3.2.0,M11.1.0"
+#endif
+#ifndef UPDATE_INTERVAL_MS
+#define UPDATE_INTERVAL_MS 10000
+#endif
+#ifndef WEATHER_INTERVAL_MS
+#define WEATHER_INTERVAL_MS 600000
+#endif
+#ifndef DEFAULT_HOME_LAT
+#define DEFAULT_HOME_LAT 41.8800
+#endif
+#ifndef DEFAULT_HOME_LON
+#define DEFAULT_HOME_LON -88.0078
+#endif
+#ifndef DEFAULT_SEARCH_RADIUS_NM
+#define DEFAULT_SEARCH_RADIUS_NM 25
+#endif
+#ifndef DEFAULT_RADAR_RANGE
+#define DEFAULT_RADAR_RANGE 30
+#endif
+#ifndef DISPLAY_INVERT
+#define DISPLAY_INVERT 0
+#endif
+
+#if UNITS_IMPERIAL
+  #define DIST_UNIT "mi"
+  #define TEMP_UNIT "F"
+  #define WIND_UNIT "mph"
+  static const double KM_PER_UNIT = 1.609344;
+  static const float  RANGE_STEP = 5, RANGE_MIN = 5, RANGE_MAX = 150;
+#else
+  #define DIST_UNIT "km"
+  #define TEMP_UNIT "C"
+  #define WIND_UNIT "km/h"
+  static const double KM_PER_UNIT = 1.0;
+  static const float  RANGE_STEP = 10, RANGE_MIN = 10, RANGE_MAX = 250;
+#endif
+static const float MAX_SEARCH_NM = 250;   // airplanes.live point-query limit
+
 // Runtime-configurable location & radar (persisted via NVS)
-// Defaults below; overridden by web UI and saved to flash.
 double homeLat = DEFAULT_HOME_LAT;
 double homeLon = DEFAULT_HOME_LON;
-double searchRadiusDeg = DEFAULT_SEARCH_RADIUS;
-float  radarMaxKm = DEFAULT_RADAR_MAX_KM;
+float  searchRadiusNm = DEFAULT_SEARCH_RADIUS_NM;  // API query radius, nautical miles
+float  radarRange = DEFAULT_RADAR_RANGE;           // radar scope radius, display units
 
-SemaphoreHandle_t configMutex = NULL;  // protects homeLat/Lon/Radius/radarMaxKm
+SemaphoreHandle_t configMutex = NULL;  // protects homeLat/Lon/searchRadiusNm/radarRange
 WebServer server(80);
 Preferences prefs;
 // =======================================================================
@@ -52,9 +99,9 @@ TFT_eSprite radarSpr = TFT_eSprite(&tft);
 
 // Data models
 struct Aircraft {
-  char callsign[10]; char country[24];
-  double lat; double lon; float altitudeM; float velocityMs;
-  float trackDeg; float vrateMs; bool onGround; int category;
+  char callsign[10]; char type[6]; char reg[10]; char airline[28];
+  double lat; double lon; int altFt; float gsKt;
+  float trackDeg; int vrateFpm; bool onGround;
   double distanceKm; double bearingDeg; bool valid;
   char dep[5]; char arr[5]; bool hasRoute;
 };
@@ -65,8 +112,8 @@ const uint8_t MAX_TOP5 = 5;
 Aircraft top5[MAX_TOP5];
 uint8_t top5Count = 0;
 
-// Blips for Radar
-struct Blip { double lat; double lon; float track; float speedMs; char callsign[10]; float altitudeM; };
+// Blips for Radar (the MAX_BLIPS nearest aircraft)
+struct Blip { double lat; double lon; float track; float speedKt; char callsign[10]; int altFt; double distKm; };
 const uint8_t MAX_BLIPS = 20;
 Blip blips[MAX_BLIPS];
 uint8_t blipCount = 0;
@@ -76,20 +123,19 @@ uint32_t lastDataMs = 0;
 SemaphoreHandle_t dataMutex = NULL;
 TaskHandle_t fetchTaskHandle = NULL;
 volatile bool newDataReady = false;
-volatile bool fetchInProgress = false;
 
 // Route Cache
+const uint8_t ROUTE_CACHE_SIZE = 15;
 struct CachedRoute {
   char callsign[10];
-  char dep[5]; char arr[5];
+  char dep[5]; char arr[5]; char airline[28];
   bool valid; uint32_t fetchTime;
 };
-CachedRoute routeCache[15];
+CachedRoute routeCache[ROUTE_CACHE_SIZE];
 
 struct Weather {
-  float tempC; float windKmh; int humidity; int code; bool valid = false;
+  float temp; float wind; int humidity; bool valid = false;
 } weather;
-uint32_t lastWeatherPoll = 0;
 
 struct Stats {
   uint32_t requestsOk = 0; uint32_t requestsFail = 0;
@@ -101,8 +147,7 @@ uint8_t screen = 0;
 uint8_t lastScreen = 255;
 uint32_t lastScreenSwap = 0;
 uint32_t lastTouchMs = 0;
-bool firstWeatherDone = false;
-const uint8_t NUM_SCREENS = 4; // Reduced from 5 to 4 screens
+const uint8_t NUM_SCREENS = 4;
 const uint32_t SCREEN_SWAP_MS = 10000;
 
 // ---------------------------------------------------------------------------
@@ -138,6 +183,17 @@ void projectLatLon(double lat, double lon, float trackDeg, double distM, double&
   outLat = rad2deg(nla); outLon = rad2deg(nlo);
 }
 
+// Copy, dropping non-ASCII bytes (built-in TFT fonts are ASCII only) and trailing spaces
+void copyAscii(char* dst, const char* src, size_t n) {
+  size_t j = 0;
+  for (size_t i = 0; src && src[i] && j < n - 1; i++)
+    if ((uint8_t)src[i] < 128) dst[j++] = src[i];
+  dst[j] = '\0';
+  while (j > 0 && dst[j - 1] == ' ') dst[--j] = '\0';
+}
+
+double toDisplayDist(double km) { return km / KM_PER_UNIT; }
+
 // ---------------------------------------------------------------------------
 // Network & APIs
 // ---------------------------------------------------------------------------
@@ -150,130 +206,168 @@ void connectWiFi() {
   tft.drawString("Connecting WiFi...", 20, 100);
   while (WiFi.status() != WL_CONNECTED) { delay(400); }
   tft.fillScreen(TFT_BLACK);
+  lastScreen = 255;  // force full redraw of the current page
 }
 
-bool getRoute(const char* callsign, char* dep, char* arr) {
-  if (strlen(callsign) == 0 || strcmp(callsign, "(no id)") == 0) return false;
-  
-  for (int i=0; i<15; i++) {
-    if (routeCache[i].valid && strcmp(routeCache[i].callsign, callsign) == 0) {
-      if (routeCache[i].dep[0]) {
-         strcpy(dep, routeCache[i].dep);
-         strcpy(arr, routeCache[i].arr);
-         return true;
-      }
-      return false;
-    }
-  }
-
+// GET a URL and stream-parse the JSON body (no full-payload String in RAM).
+// Returns the HTTP status code, or a negative value on connection/parse failure.
+int httpGetJson(const String& url, JsonDocument& doc, JsonDocument* filter) {
   WiFiClientSecure client; client.setInsecure();
-  HTTPClient https; https.setReuse(false);
-  String url = String("https://hexdb.io/api/v1/route/icao/") + callsign;
-  bool found = false;
-  dep[0] = '\0'; arr[0] = '\0';
+  HTTPClient https;
+  https.setReuse(false);
+  https.useHTTP10(true);   // no chunked encoding -> getStream() is plain JSON
+  https.setTimeout(10000);
+  if (!https.begin(client, url)) return -1;
+  https.addHeader("User-Agent", "CYD28PlaneSpotter/1.1");
 
-  if (https.begin(client, url)) {
-    int code = https.GET();
-    if (code == HTTP_CODE_OK) {
-      JsonDocument d;
-      if (!deserializeJson(d, https.getString())) {
-        const char* r = d["route"] | "";
-        const char* dash = strchr(r, '-');
-        if (r[0] && dash) {
-          size_t dl = dash - r;
-          if (dl < 5) {
-            strncpy(dep, r, dl); dep[dl] = '\0';
-            strncpy(arr, dash + 1, 4); arr[4] = '\0';
-            found = true;
-          }
-        }
-      }
+  int code = https.GET();
+  if (code != HTTP_CODE_OK) { https.end(); return code; }
+
+  DeserializationError err = filter
+      ? deserializeJson(doc, https.getStream(), DeserializationOption::Filter(*filter))
+      : deserializeJson(doc, https.getStream());
+  https.end();
+  if (err) {
+    Serial.printf("JSON error (%s): %s\n", err.c_str(), url.c_str());
+    return -2;
+  }
+  return code;
+}
+
+// Fills a.dep / a.arr / a.airline from adsbdb (cached). Returns true if a route is known.
+bool getRoute(Aircraft& a) {
+  a.dep[0] = a.arr[0] = a.airline[0] = '\0';
+  const char* cs = a.callsign;
+  if (strlen(cs) < 3 || strcmp(cs, "(no id)") == 0) return false;
+
+  for (int i = 0; i < ROUTE_CACHE_SIZE; i++) {
+    if (routeCache[i].valid && strcmp(routeCache[i].callsign, cs) == 0) {
+      strcpy(a.dep, routeCache[i].dep);
+      strcpy(a.arr, routeCache[i].arr);
+      strcpy(a.airline, routeCache[i].airline);
+      return a.dep[0] != '\0';
     }
-    https.end();
   }
 
+  JsonDocument filter;
+  filter["response"]["flightroute"]["airline"]["name"] = true;
+  filter["response"]["flightroute"]["origin"]["iata_code"] = true;
+  filter["response"]["flightroute"]["origin"]["icao_code"] = true;
+  filter["response"]["flightroute"]["destination"]["iata_code"] = true;
+  filter["response"]["flightroute"]["destination"]["icao_code"] = true;
+
+  JsonDocument d;
+  int code = httpGetJson(String("https://api.adsbdb.com/v0/callsign/") + cs, d, &filter);
+  if (code != HTTP_CODE_OK && code != HTTP_CODE_NOT_FOUND) return false;  // transient: don't cache
+
+  if (code == HTTP_CODE_OK) {
+    JsonObject r = d["response"]["flightroute"];
+    if (!r.isNull()) {
+      const char* o = r["origin"]["iata_code"] | "";
+      if (!o[0]) o = r["origin"]["icao_code"] | "";
+      const char* t = r["destination"]["iata_code"] | "";
+      if (!t[0]) t = r["destination"]["icao_code"] | "";
+      if (o[0] && t[0]) {
+        copyAscii(a.dep, o, sizeof(a.dep));
+        copyAscii(a.arr, t, sizeof(a.arr));
+      }
+      copyAscii(a.airline, r["airline"]["name"] | "", sizeof(a.airline));
+    }
+  }
+
+  // Cache both hits and "unknown callsign" answers
   int replaceIdx = 0;
   uint32_t oldest = 0xFFFFFFFF;
-  for (int i=0; i<15; i++) {
+  for (int i = 0; i < ROUTE_CACHE_SIZE; i++) {
     if (!routeCache[i].valid) { replaceIdx = i; break; }
     if (routeCache[i].fetchTime < oldest) { oldest = routeCache[i].fetchTime; replaceIdx = i; }
   }
-  routeCache[replaceIdx].valid = true;
-  strcpy(routeCache[replaceIdx].callsign, callsign);
-  strcpy(routeCache[replaceIdx].dep, dep);
-  strcpy(routeCache[replaceIdx].arr, arr);
-  routeCache[replaceIdx].fetchTime = millis();
+  CachedRoute& c = routeCache[replaceIdx];
+  c.valid = true;
+  strcpy(c.callsign, cs);
+  strcpy(c.dep, a.dep);
+  strcpy(c.arr, a.arr);
+  strcpy(c.airline, a.airline);
+  c.fetchTime = millis();
 
-  return found;
+  return a.dep[0] != '\0';
 }
 
 // Fetches aircraft data into caller-provided local buffers (thread-safe — no globals touched)
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                      Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut) {
   // Snapshot config under mutex (Core 0 reads, Core 1 may write via web UI)
-  double hLat, hLon, sRad; float rMax;
+  double hLat, hLon; float sRadNm;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-  hLat = homeLat; hLon = homeLon; sRad = searchRadiusDeg; rMax = radarMaxKm;
+  hLat = homeLat; hLon = homeLon; sRadNm = searchRadiusNm;
   if (configMutex) xSemaphoreGive(configMutex);
 
-  WiFiClientSecure client; client.setInsecure();
-  HTTPClient https; https.setReuse(false);
-  String url = "https://opensky-network.org/api/states/all?lamin=" + String(hLat - sRad, 4) + 
-         "&lomin=" + String(hLon - sRad, 4) + "&lamax=" + String(hLat + sRad, 4) + 
-         "&lomax=" + String(hLon + sRad, 4) + "&extended=1";
+  String url = "https://api.airplanes.live/v2/point/" + String(hLat, 4) + "/" +
+               String(hLon, 4) + "/" + String((int)ceilf(sRadNm));
 
-  if (!https.begin(client, url)) { stats.requestsFail++; return false; }
-  int code = https.GET();
-  if (code != HTTP_CODE_OK) { https.end(); stats.requestsFail++; return false; }
-
+  // Keep only the fields we use — near a big airport the raw payload is large
   JsonDocument filter;
-  JsonArray el = filter["states"].to<JsonArray>().add<JsonArray>();
-  for (int i = 0; i <= 17; i++) el[i] = false;
-  el[0] = el[1] = el[2] = el[5] = el[6] = el[7] = el[8] = el[9] = el[10] = el[11] = el[13] = el[17] = true;
+  filter["ac"][0]["flight"]    = true;
+  filter["ac"][0]["r"]         = true;
+  filter["ac"][0]["t"]         = true;
+  filter["ac"][0]["lat"]       = true;
+  filter["ac"][0]["lon"]       = true;
+  filter["ac"][0]["alt_baro"]  = true;
+  filter["ac"][0]["alt_geom"]  = true;
+  filter["ac"][0]["gs"]        = true;
+  filter["ac"][0]["track"]     = true;
+  filter["ac"][0]["baro_rate"] = true;
+  filter["ac"][0]["geom_rate"] = true;
 
-  String payload = https.getString(); https.end();
   JsonDocument doc;
-  if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) { stats.requestsFail++; return false; }
+  if (httpGetJson(url, doc, &filter) != HTTP_CODE_OK) { stats.requestsFail++; return false; }
 
-  JsonArray states = doc["states"].as<JsonArray>();
-  uint16_t count = 0; 
+  uint16_t count = 0;
   blipCntOut = 0;
   top5CntOut = 0;
 
-  for (JsonArray s : states) {
-    if (s.isNull() || s[5].isNull() || s[6].isNull()) continue;
+  for (JsonObject s : doc["ac"].as<JsonArray>()) {
+    if (!s["lat"].is<double>() || !s["lon"].is<double>()) continue;
 
-    // Skip aircraft on the ground — only track those in flight
-    if (s[8] | false) continue;
+    // Skip aircraft on the ground (alt_baro == "ground") — only track those in flight
+    if (s["alt_baro"].is<const char*>()) continue;
 
-    double lon = s[5].as<double>(), lat = s[6].as<double>();
+    double lat = s["lat"].as<double>(), lon = s["lon"].as<double>();
     double d = haversineKm(hLat, hLon, lat, lon);
     double brg = bearingDeg(hLat, hLon, lat, lon);
+    int altFt = s["alt_baro"].is<int>() ? s["alt_baro"].as<int>() : (s["alt_geom"] | 0);
+    float gsKt = s["gs"] | 0.0f;
+    float track = s["track"] | 0.0f;
+    char cs[10];
+    copyAscii(cs, s["flight"] | "", sizeof(cs));
+    if (cs[0] == '\0') copyAscii(cs, s["r"] | "", sizeof(cs));  // fall back to registration
     count++;
 
+    // Radar keeps the MAX_BLIPS nearest aircraft (replace the farthest when full)
+    int slot = -1;
     if (blipCntOut < MAX_BLIPS) {
-      blipsOut[blipCntOut].lat = lat; blipsOut[blipCntOut].lon = lon;
-      blipsOut[blipCntOut].track = s[10] | 0.0f;
-      blipsOut[blipCntOut].speedMs = (s[8] | false) ? 0.0f : (s[9] | 0.0f);
-      blipsOut[blipCntOut].altitudeM = s[13].isNull() ? (s[7] | 0.0f) : s[13].as<float>();
-      const char* cs = s[1] | "";
-      strncpy(blipsOut[blipCntOut].callsign, cs, 9);
-      blipsOut[blipCntOut].callsign[9] = '\0';
-      blipCntOut++;
+      slot = blipCntOut++;
+    } else {
+      double farthest = d;
+      for (int i = 0; i < MAX_BLIPS; i++)
+        if (blipsOut[i].distKm > farthest) { farthest = blipsOut[i].distKm; slot = i; }
+    }
+    if (slot >= 0) {
+      Blip& b = blipsOut[slot];
+      b.lat = lat; b.lon = lon; b.track = track; b.speedKt = gsKt;
+      b.altFt = altFt; b.distKm = d;
+      strcpy(b.callsign, cs);
     }
 
     Aircraft a;
     a.distanceKm = d; a.lat = lat; a.lon = lon; a.bearingDeg = brg;
-    a.onGround = s[8] | false; a.category = s[17] | 0;
-    a.altitudeM = s[13].isNull() ? (s[7] | 0.0f) : s[13].as<float>();
-    a.velocityMs = s[9] | 0.0f; a.trackDeg = s[10] | 0.0f; a.vrateMs = s[11] | 0.0f;
-    a.hasRoute = false; a.dep[0] = '\0'; a.arr[0] = '\0';
+    a.onGround = false; a.altFt = altFt; a.gsKt = gsKt; a.trackDeg = track;
+    a.vrateFpm = s["baro_rate"].is<int>() ? s["baro_rate"].as<int>() : (s["geom_rate"] | 0);
+    a.hasRoute = false; a.dep[0] = a.arr[0] = a.airline[0] = '\0';
     a.valid = true;
-    
-    strncpy(a.callsign, s[1] | "", 9); a.callsign[9] = '\0';
-    for (int i = strlen(a.callsign) - 1; i >= 0 && a.callsign[i] == ' '; i--) a.callsign[i] = '\0';
-    if (a.callsign[0] == '\0') strcpy(a.callsign, "(no id)");
-    strncpy(a.country, s[2] | "?", 23); a.country[23] = '\0';
+    strcpy(a.callsign, cs[0] ? cs : "(no id)");
+    copyAscii(a.type, s["t"] | "", sizeof(a.type));
+    copyAscii(a.reg, s["r"] | "", sizeof(a.reg));
 
     int insertIdx = -1;
     for (int i = 0; i < MAX_TOP5; i++) {
@@ -302,6 +396,30 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   return true;
 }
 
+bool fetchWeatherTo(Weather& w) {
+  double hLat, hLon;
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  hLat = homeLat; hLon = homeLon;
+  if (configMutex) xSemaphoreGive(configMutex);
+
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(hLat, 4) +
+               "&longitude=" + String(hLon, 4) +
+               "&current=temperature_2m,relative_humidity_2m,wind_speed_10m";
+#if UNITS_IMPERIAL
+  url += "&temperature_unit=fahrenheit&wind_speed_unit=mph";
+#endif
+
+  JsonDocument doc;
+  if (httpGetJson(url, doc, nullptr) != HTTP_CODE_OK) return false;
+  JsonObject c = doc["current"]; if (c.isNull()) return false;
+
+  w.temp = c["temperature_2m"] | 0.0f;
+  w.humidity = c["relative_humidity_2m"] | 0;
+  w.wind = c["wind_speed_10m"] | 0.0f;
+  w.valid = true;
+  return true;
+}
+
 // ===================================================================
 // Background Data Fetcher — runs on Core 0 so Core 1 stays smooth
 // ===================================================================
@@ -314,58 +432,48 @@ void dataFetcherTask(void* param) {
   Aircraft locNearest;
   locNearest.valid = false;
 
+  uint32_t lastWeatherMs = 0;
+  bool weatherDone = false;
+
   for (;;) {
-    // Wait for the next poll interval (sleep in 1s chunks so task is responsive)
+    if (WiFi.status() == WL_CONNECTED) {
+      // Weather (every WEATHER_INTERVAL_MS) — previously blocked the UI loop
+      if (!weatherDone || millis() - lastWeatherMs >= WEATHER_INTERVAL_MS) {
+        Weather w;
+        if (fetchWeatherTo(w)) {
+          xSemaphoreTake(dataMutex, portMAX_DELAY);
+          weather = w;
+          xSemaphoreGive(dataMutex);
+        }
+        lastWeatherMs = millis();
+        weatherDone = true;
+      }
+
+      if (fetchAircraftTo(locTop5, locTop5Count, locNearest, locBlips, locBlipCount)) {
+        // Routes for the top 5 (cached, so usually no network call)
+        for (int i = 0; i < locTop5Count; i++)
+          locTop5[i].hasRoute = getRoute(locTop5[i]);
+        if (locTop5Count > 0) locNearest = locTop5[0];
+
+        // Atomically publish results to the globals used by render()
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        memcpy(blips, locBlips, sizeof(locBlips));
+        blipCount = locBlipCount;
+        memcpy(top5, locTop5, sizeof(locTop5));
+        top5Count = locTop5Count;
+        nearest = locNearest;
+        lastDataMs = millis();
+        stats.lastUpdateMs = lastDataMs;
+        newDataReady = true;
+        xSemaphoreGive(dataMutex);
+      }
+    }
+
+    // Wait for the next poll interval (1 s chunks keep the task responsive)
     for (int t = 0; t < UPDATE_INTERVAL_MS / 1000; t++) {
       vTaskDelay(pdMS_TO_TICKS(1000));
     }
-
-    fetchInProgress = true;
-    bool ok = fetchAircraftTo(locTop5, locTop5Count, locNearest, locBlips, locBlipCount);
-    fetchInProgress = false;
-
-    if (ok) {
-      // Fetch routes for the top 5 (quick per-call, but may still block a bit)
-      for (int i = 0; i < locTop5Count; i++) {
-        locTop5[i].hasRoute = getRoute(locTop5[i].callsign, locTop5[i].dep, locTop5[i].arr);
-        locNearest = locTop5[0]; // nearest = closest after route resolution
-      }
-
-      // Atomically publish results to the globals used by render()
-      xSemaphoreTake(dataMutex, portMAX_DELAY);
-      memcpy(blips, locBlips, sizeof(locBlips));
-      blipCount = locBlipCount;
-      memcpy(top5, locTop5, sizeof(locTop5));
-      top5Count = locTop5Count;
-      nearest = locNearest;
-      lastDataMs = millis();
-      stats.lastUpdateMs = lastDataMs;
-      newDataReady = true;
-      xSemaphoreGive(dataMutex);
-    }
   }
-}
-
-bool fetchWeather() {
-  // Snapshot config under mutex
-  double hLat, hLon;
-  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-  hLat = homeLat; hLon = homeLon;
-  if (configMutex) xSemaphoreGive(configMutex);
-
-  WiFiClientSecure client; client.setInsecure(); HTTPClient https; https.setReuse(false);
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(hLat, 4) + "&longitude=" + String(hLon, 4) + "&current=temperature_2m,relative_humidity_2m,wind_speed_10m";
-  if (!https.begin(client, url)) return false;
-  int code = https.GET();
-  if (code != HTTP_CODE_OK) { https.end(); return false; }
-  String payload = https.getString(); https.end();
-
-  JsonDocument doc; if (deserializeJson(doc, payload)) return false;
-  JsonObject c = doc["current"]; if (c.isNull()) return false;
-  
-  weather.tempC = c["temperature_2m"] | 0.0f; weather.humidity = c["relative_humidity_2m"] | 0;
-  weather.windKmh = c["wind_speed_10m"] | 0.0f; weather.valid = true;
-  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,14 +489,14 @@ void fmtClock(char* buf, size_t n, bool withSecs) {
 void drawHeader(const char* title, bool newPage) {
   tft.setTextFont(2);
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  
+
   if (newPage) {
     char left[30]; snprintf(left, sizeof(left), "%s [%d/%d]", title, screen + 1, NUM_SCREENS);
     tft.setTextPadding(200);
     tft.drawString(left, 10, 5);
     tft.drawLine(0, 25, 320, 25, TFT_DARKGREY);
   }
-  
+
   char t[10]; fmtClock(t, sizeof(t), true);
   tft.setTextPadding(80);
   tft.drawString(t, 240, 5);
@@ -407,61 +515,79 @@ void drawArrow(int cx, int cy, int r, double angleDeg, uint16_t color) {
 
 void screenTargetIntel(bool newPage) {
   drawHeader("TARGET INTEL", newPage);
-  tft.setTextPadding(300);
-  
+
   if (!nearest.valid) {
+    tft.setTextPadding(300);
     tft.setTextFont(4);
     tft.setTextColor(TFT_RED, TFT_BLACK);
     tft.drawString("NO TARGET IN RANGE", 40, 100);
+    tft.setTextPadding(0);
     return;
   }
 
+  tft.setTextPadding(140);
   tft.setTextFont(4);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString(nearest.callsign, 20, 40);
-  
+  tft.drawString(nearest.callsign, 20, 36);
+
   tft.setTextFont(2);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextPadding(150);
   if (nearest.hasRoute) {
     char rte[32]; snprintf(rte, sizeof(rte), "Route: %s -> %s", nearest.dep, nearest.arr);
-    tft.drawString(rte, 160, 45);
+    tft.drawString(rte, 160, 42);
   } else {
-    tft.drawString("Route: Unknown", 160, 45);
+    tft.drawString("Route: Unknown", 160, 42);
   }
-  
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  char buf[64];
-  snprintf(buf, sizeof(buf), "Country: %s", nearest.country);
-  tft.drawString(buf, 20, 80);
-  
-  snprintf(buf, sizeof(buf), "Distance: %.1f km (%s)", nearest.distanceKm, compass(nearest.bearingDeg));
-  tft.drawString(buf, 20, 110);
-  
-  float altFeet = nearest.altitudeM * 3.28084f;
-  if (nearest.onGround) snprintf(buf, sizeof(buf), "Altitude: On Ground");
-  else snprintf(buf, sizeof(buf), "Alt: %.0f ft (FL%03.0f)", altFeet, altFeet / 100.0f);
-  tft.drawString(buf, 20, 140);
-  
-  snprintf(buf, sizeof(buf), "Speed: %.0f km/h", nearest.velocityMs * 3.6);
-  tft.drawString(buf, 20, 170);
 
-  tft.fillRect(220, 110, 60, 60, TFT_BLACK); 
+  // Text rows stop short of the heading arrow (x >= 215)
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextPadding(195);
+  char buf[64];
+
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString(nearest.airline[0] ? nearest.airline : " ", 20, 68);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  snprintf(buf, sizeof(buf), "Type: %s  Reg: %s",
+           nearest.type[0] ? nearest.type : "?", nearest.reg[0] ? nearest.reg : "?");
+  tft.drawString(buf, 20, 93);
+
+  snprintf(buf, sizeof(buf), "Distance: %.1f %s (%s)",
+           toDisplayDist(nearest.distanceKm), DIST_UNIT, compass(nearest.bearingDeg));
+  tft.drawString(buf, 20, 118);
+
+  if (nearest.vrateFpm >= 300 || nearest.vrateFpm <= -300)
+    snprintf(buf, sizeof(buf), "Alt: %d ft  %+d fpm", nearest.altFt, nearest.vrateFpm);
+  else
+    snprintf(buf, sizeof(buf), "Alt: %d ft (FL%03d)", nearest.altFt, (nearest.altFt + 50) / 100);
+  tft.drawString(buf, 20, 143);
+
+#if UNITS_IMPERIAL
+  snprintf(buf, sizeof(buf), "Speed: %.0f kt (%.0f mph)", nearest.gsKt, nearest.gsKt * 1.15078f);
+#else
+  snprintf(buf, sizeof(buf), "Speed: %.0f kt (%.0f km/h)", nearest.gsKt, nearest.gsKt * 1.852f);
+#endif
+  tft.drawString(buf, 20, 168);
+
+  tft.fillRect(220, 110, 60, 60, TFT_BLACK);
   drawArrow(250, 140, 25, nearest.trackDeg, TFT_CYAN);
+  tft.setTextPadding(80);
   snprintf(buf, sizeof(buf), "HDG %03.0f", nearest.trackDeg);
   tft.drawString(buf, 225, 180);
-  
+
   tft.setTextPadding(0);
 }
 
 void screenTop5(bool newPage) {
   drawHeader("TOP 5 IN RANGE", newPage);
-  
+
   if (top5Count == 0) {
     tft.setTextFont(4); tft.setTextColor(TFT_RED, TFT_BLACK);
     tft.drawString("NO TARGETS", 100, 100);
     return;
   }
-  
+
   if (newPage) {
     tft.setTextFont(2); tft.setTextColor(TFT_CYAN, TFT_BLACK);
     tft.drawString("FLIGHT", 10, 40);
@@ -469,30 +595,26 @@ void screenTop5(bool newPage) {
     tft.drawString("ALTITUDE", 190, 40);
     tft.drawLine(10, 60, 310, 60, TFT_DARKGREY);
   }
-  
+
   tft.setTextFont(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextPadding(80); 
-  
+  tft.setTextPadding(80);
+
   int y = 70;
   for (int i=0; i<5; i++) {
     if (i < top5Count) {
       tft.drawString(top5[i].callsign, 10, y);
-      
+
       char rte[16];
       if (top5[i].hasRoute) snprintf(rte, sizeof(rte), "%s->%s", top5[i].dep, top5[i].arr);
       else strcpy(rte, "N/A");
       tft.drawString(rte, 100, y);
-      
+
       char alt[32];
-      tft.setTextPadding(120); 
-      if (top5[i].onGround) strcpy(alt, "Ground");
-      else {
-        float ft = top5[i].altitudeM * 3.28084f;
-        snprintf(alt, sizeof(alt), "%.0f ft (FL%03.0f)", ft, ft/100.0f);
-      }
+      tft.setTextPadding(120);
+      snprintf(alt, sizeof(alt), "%d ft (FL%03d)", top5[i].altFt, (top5[i].altFt + 50) / 100);
       tft.drawString(alt, 190, y);
       tft.setTextPadding(80);
-      
+
     } else {
       tft.drawString(" ", 10, y);
       tft.drawString(" ", 100, y);
@@ -505,22 +627,27 @@ void screenTop5(bool newPage) {
   tft.setTextPadding(0);
 }
 
+// Range buttons on the radar page (drawn and hit-tested from the same constants)
+const int BTN_Y = 215, BTN_H = 20, BTN_W = 30;
+const int BTN_MINUS_X = 10, BTN_PLUS_X = 50;
+
 void screenRadar(bool newPage) {
   drawHeader("RADAR PPI", newPage);
 
   // Snapshot config under mutex
-  double hLat, hLon; float rMax;
+  double hLat, hLon; float rRange;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-  hLat = homeLat; hLon = homeLon; rMax = radarMaxKm;
+  hLat = homeLat; hLon = homeLon; rRange = radarRange;
   if (configMutex) xSemaphoreGive(configMutex);
+  double rMaxKm = rRange * KM_PER_UNIT;
 
   tft.setTextFont(2); tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextPadding(110);
-  char buf[32]; snprintf(buf, sizeof(buf), "Contacts: %u", blipCount);
+  char buf[32]; snprintf(buf, sizeof(buf), "Contacts: %u", stats.inView);
   tft.drawString(buf, 5, 50);
   if(nearest.valid) {
     snprintf(buf, sizeof(buf), "TGT: %s", nearest.callsign);
     tft.drawString(buf, 5, 80);
-    snprintf(buf, sizeof(buf), "%.1f km", nearest.distanceKm);
+    snprintf(buf, sizeof(buf), "%.1f %s", toDisplayDist(nearest.distanceKm), DIST_UNIT);
     tft.drawString(buf, 5, 110);
   } else {
     tft.drawString("No TGT", 5, 80);
@@ -547,11 +674,12 @@ void screenRadar(bool newPage) {
 
   for (uint8_t i = 0; i < blipCount; i++) {
     double la = blips[i].lat, lo = blips[i].lon;
-    if (blips[i].speedMs > 0 && elapsed > 0)
-      projectLatLon(blips[i].lat, blips[i].lon, blips[i].track, blips[i].speedMs * elapsed, la, lo);
+    if (blips[i].speedKt > 0 && elapsed > 0)
+      projectLatLon(blips[i].lat, blips[i].lon, blips[i].track,
+                    blips[i].speedKt * 0.514444f * elapsed, la, lo);
 
     double dist = haversineKm(hLat, hLon, la, lo);
-    float fr = (float)(dist / rMax);
+    float fr = (float)(dist / rMaxKm);
     if (fr > 1) continue;
 
     int rr = (int)(fr * R);
@@ -563,8 +691,8 @@ void screenRadar(bool newPage) {
     if (behind < 30) radarSpr.fillCircle(bx, by, 3, TFT_YELLOW);
     else radarSpr.fillRect(bx, by, 2, 2, TFT_GREEN);
 
-    // Draw callsign label in smallest legible font
-    if (blips[i].callsign[0] && strcmp(blips[i].callsign, "(no id)") != 0) {
+    // Callsign, flight level and speed in the smallest legible font
+    if (blips[i].callsign[0]) {
       int lx = bx + 4;
       int ly = by - 4;
       if (lx + 54 > 200) lx = bx - 54;
@@ -572,18 +700,14 @@ void screenRadar(bool newPage) {
       if (ly > 192) ly = 192;
       radarSpr.drawString(blips[i].callsign, lx, ly);
 
-      // Draw FL below callsign
-      float altFt = blips[i].altitudeM * 3.28084f;
       char flBuf[10];
-      snprintf(flBuf, sizeof(flBuf), "FL%03.0f", altFt / 100.0f);
+      snprintf(flBuf, sizeof(flBuf), "FL%03d", (blips[i].altFt + 50) / 100);
       int ly2 = ly + 8;
       if (ly2 > 192) ly2 = 192;
       radarSpr.drawString(flBuf, lx, ly2);
 
-      // Draw speed (knots) below FL
-      float speedKt = blips[i].speedMs * 1.94384f;
       char spBuf[10];
-      snprintf(spBuf, sizeof(spBuf), "%ukn", (unsigned int)(speedKt + 0.5f));
+      snprintf(spBuf, sizeof(spBuf), "%ukn", (unsigned int)(blips[i].speedKt + 0.5f));
       int ly3 = ly + 16;
       if (ly3 > 192) ly3 = 192;
       radarSpr.drawString(spBuf, lx, ly3);
@@ -591,78 +715,75 @@ void screenRadar(bool newPage) {
   }
   radarSpr.pushSprite(115, 35);
 
-  // --- Range indicator & +/- buttons (bottom-left, side by side) ---
-  // Range label
+  // --- Range indicator & -/+ buttons (bottom-left, side by side) ---
   tft.setTextFont(2);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
   tft.setTextPadding(80);
-  char rng[16]; snprintf(rng, sizeof(rng), "RNG %d km", (int)rMax);
+  char rng[16]; snprintf(rng, sizeof(rng), "RNG %d %s", (int)rRange, DIST_UNIT);
   tft.drawString(rng, 10, 193);
 
-  // "-" button (left, 30x20)
-  tft.fillRoundRect(10, 215, 30, 20, 4, TFT_DARKGREY);
+  tft.fillRoundRect(BTN_MINUS_X, BTN_Y, BTN_W, BTN_H, 4, TFT_DARKGREY);
+  tft.fillRoundRect(BTN_PLUS_X,  BTN_Y, BTN_W, BTN_H, 4, TFT_DARKGREY);
   tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-  tft.setTextFont(2);
-  tft.setTextPadding(30);
-  tft.drawString("-", 20, 216);
-
-  // "+" button (right of "-", 30x20)
-  tft.fillRoundRect(50, 215, 30, 20, 4, TFT_DARKGREY);
-  tft.drawString("+", 60, 216);
-
   tft.setTextPadding(0);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("-", BTN_MINUS_X + BTN_W / 2, BTN_Y + BTN_H / 2);
+  tft.drawString("+", BTN_PLUS_X + BTN_W / 2,  BTN_Y + BTN_H / 2);
+  tft.setTextDatum(TL_DATUM);
 }
 
 // Unified Weather and System Screen
 void screenWeatherSystem(bool newPage) {
   drawHeader("WEATHER & SYSTEM", newPage);
-  
+
   if (newPage) {
-    // Divider line between weather and system info
     tft.drawLine(10, 115, 310, 115, TFT_DARKGREY);
   }
 
   // --- TOP HALF: WEATHER ---
-  if (!weather.valid) { 
+  if (!weather.valid) {
     tft.setTextFont(4);
     tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.drawString("NO WX DATA", 20, 50); 
+    tft.drawString("NO WX DATA", 20, 50);
   } else {
     tft.setTextFont(4);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.setTextPadding(100);
-    char buf[32]; snprintf(buf, sizeof(buf), "%.1f C", weather.tempC);
+    tft.setTextPadding(130);
+    char buf[32]; snprintf(buf, sizeof(buf), "%.1f %s", weather.temp, TEMP_UNIT);
     tft.drawString(buf, 20, 45);
 
-    tft.setTextFont(2); 
+    tft.setTextFont(2);
     tft.setTextColor(TFT_CYAN, TFT_BLACK);
     tft.setTextPadding(150);
     snprintf(buf, sizeof(buf), "Humidity: %d%%", weather.humidity);
     tft.drawString(buf, 160, 45);
-    snprintf(buf, sizeof(buf), "Wind: %.0f km/h", weather.windKmh);
+    snprintf(buf, sizeof(buf), "Wind: %.0f %s", weather.wind, WIND_UNIT);
     tft.drawString(buf, 160, 75);
   }
 
   // --- BOTTOM HALF: SYSTEM ---
-  tft.setTextFont(2); 
-  tft.setTextColor(TFT_WHITE, TFT_BLACK); 
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextPadding(160);
-  
+
   char bufSys[64];
   uint32_t up = millis() / 1000;
   snprintf(bufSys, sizeof(bufSys), "Uptime: %02lu:%02lu:%02lu", up / 3600, (up % 3600) / 60, up % 60);
   tft.drawString(bufSys, 20, 130);
-  
+
   snprintf(bufSys, sizeof(bufSys), "WiFi RSSI: %d dBm", WiFi.RSSI());
   tft.drawString(bufSys, 180, 130);
-  
+
   snprintf(bufSys, sizeof(bufSys), "RAM Free: %d KB", ESP.getFreeHeap() / 1024);
   tft.drawString(bufSys, 20, 160);
-  
-  tft.setTextPadding(300); // Larger padding for API count
+
+  snprintf(bufSys, sizeof(bufSys), "Max seen: %u", stats.maxInView);
+  tft.drawString(bufSys, 180, 160);
+
+  tft.setTextPadding(300);
   snprintf(bufSys, sizeof(bufSys), "API Req: %lu OK / %lu FAIL", stats.requestsOk, stats.requestsFail);
   tft.drawString(bufSys, 20, 190);
-  
+
   tft.setTextPadding(0);
 }
 
@@ -673,7 +794,7 @@ void render() {
     lastScreen = screen;
     newPage = true;
   }
-  
+
   // Take mutex for the duration of rendering so we see a consistent snapshot
   if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
   switch (screen) {
@@ -685,15 +806,24 @@ void render() {
   if (dataMutex) xSemaphoreGive(dataMutex);
 }
 
+void changeRange(float delta) {
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  radarRange = constrain(radarRange + delta, RANGE_MIN, RANGE_MAX);
+  float r = radarRange;
+  if (configMutex) xSemaphoreGive(configMutex);
+  prefs.putFloat("range_u", r);
+  Serial.printf("Radar range: %d %s\n", (int)r, DIST_UNIT);
+}
+
 void checkTouch() {
   if (ts.touched()) {
     TS_Point p = ts.getPoint();
-    
-    // STRICT FILTER: 
+
+    // STRICT FILTER:
     // 1. p.z > 400 ignores light ghost touches and case pinching.
     // 2. p.x and p.y bounds ignore the 0 and 4095 coordinate spikes caused by SPI noise.
     if (p.z > 400 && p.x > 100 && p.x < 4000 && p.y > 100 && p.y < 4000) {
-      
+
       if (millis() - lastTouchMs > 400) { // 400ms debounce to prevent double-skips
         lastTouchMs = millis();
 
@@ -704,35 +834,20 @@ void checkTouch() {
         sx = constrain(sx, 0, 319);
         sy = constrain(sy, 0, 239);
 
-        // Debug: print touch coords for calibration
         static uint32_t lastDebug = 0;
         if (millis() - lastDebug > 2000) {
           Serial.printf("Touch: raw(%d,%d,%d) -> screen(%d,%d)\n", p.x, p.y, p.z, sx, sy);
           lastDebug = millis();
         }
 
-        // Screen-specific touch handling
-        if (screen == 2) {
-          // Radar screen: check +/- range buttons (bottom-left, stacked vertically)
-          // "+" button: sx=10..50, sy=160..205
-          if (sx >= 10 && sx <= 50 && sy >= 160 && sy <= 205) {
-            if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-            radarMaxKm = min(200.0f, radarMaxKm + 10.0f);
-            if (configMutex) xSemaphoreGive(configMutex);
-            prefs.putFloat("range", radarMaxKm);
-            Serial.printf("Range increased: %d km\n", (int)radarMaxKm);
-            lastScreenSwap = millis();
-            return;
+        // Radar screen: -/+ range buttons. Hit areas match the drawn buttons,
+        // padded ~8 px because the resistive panel isn't pixel-accurate.
+        if (screen == 2 && sy >= BTN_Y - 10) {
+          if (sx >= BTN_MINUS_X - 8 && sx < BTN_MINUS_X + BTN_W + 5) {
+            changeRange(-RANGE_STEP); lastScreenSwap = millis(); return;
           }
-          // "-" button: sx=10..50, sy=206..240
-          if (sx >= 10 && sx <= 50 && sy >= 206 && sy <= 240) {
-            if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-            radarMaxKm = max(10.0f, radarMaxKm - 10.0f);
-            if (configMutex) xSemaphoreGive(configMutex);
-            prefs.putFloat("range", radarMaxKm);
-            Serial.printf("Range decreased: %d km\n", (int)radarMaxKm);
-            lastScreenSwap = millis();
-            return;
+          if (sx >= BTN_PLUS_X - 5 && sx <= BTN_PLUS_X + BTN_W + 8) {
+            changeRange(+RANGE_STEP); lastScreenSwap = millis(); return;
           }
         }
 
@@ -750,10 +865,9 @@ void checkTouch() {
 void initWebServer() {
   // GET / — serve config page
   server.on("/", []() {
-    // Snapshot current values
-    double hLat, hLon, sRad; float rMax;
+    double hLat, hLon; float sRad, rRange;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-    hLat = homeLat; hLon = homeLon; sRad = searchRadiusDeg; rMax = radarMaxKm;
+    hLat = homeLat; hLon = homeLon; sRad = searchRadiusNm; rRange = radarRange;
     if (configMutex) xSemaphoreGive(configMutex);
 
     String html = R"rawliteral(
@@ -779,10 +893,10 @@ void initWebServer() {
     <input type="number" step="any" name="lat" id="lat" value=")rawliteral" + String(hLat, 6) + R"rawliteral(" required>
     <label>Home Longitude (&deg;)</label>
     <input type="number" step="any" name="lon" id="lon" value=")rawliteral" + String(hLon, 6) + R"rawliteral(" required>
-    <label>Search Radius (&deg;)</label>
-    <input type="number" step="any" name="radius" id="radius" value=")rawliteral" + String(sRad, 4) + R"rawliteral(" required>
-    <label>Radar Max Range (km)</label>
-    <input type="number" step="any" name="range" id="range" value=")rawliteral" + String(rMax, 1) + R"rawliteral(" required>
+    <label>Search Radius (nautical miles, 1&ndash;250)</label>
+    <input type="number" step="1" min="1" max="250" name="radius" id="radius" value=")rawliteral" + String((int)sRad) + R"rawliteral(" required>
+    <label>Radar Range ()rawliteral" + String(DIST_UNIT) + ", " + String((int)RANGE_MIN) + "&ndash;" + String((int)RANGE_MAX) + R"rawliteral()</label>
+    <input type="number" step="1" name="range" id="range" value=")rawliteral" + String((int)rRange) + R"rawliteral(" required>
     <button type="submit">Save Settings</button>
   </form>
   <div class="saved" id="msg">&#10003; Settings saved!</div>
@@ -795,8 +909,10 @@ function save(e){
   x.open('POST','/save',true);
   x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
   x.onload=function(){
-    if(x.status==200){document.getElementById('msg').style.display='block';
-    setTimeout(function(){document.getElementById('msg').style.display='none'},3000)}
+    var m=document.getElementById('msg');
+    m.textContent=x.status==200?'✓ Settings saved!':x.responseText;
+    m.style.display='block';
+    setTimeout(function(){m.style.display='none'},3000);
   };
   x.send('lat='+encodeURIComponent(document.getElementById('lat').value)+
          '&lon='+encodeURIComponent(document.getElementById('lon').value)+
@@ -817,32 +933,29 @@ function save(e){
 
     double newLat = server.arg("lat").toDouble();
     double newLon = server.arg("lon").toDouble();
-    double newRad = server.arg("radius").toDouble();
+    float  newRad = server.arg("radius").toFloat();
     float  newRng = server.arg("range").toFloat();
 
-    // Basic validation
     if (newLat < -90 || newLat > 90 || newLon < -180 || newLon > 180 ||
-        newRad <= 0 || newRad > 10 || newRng <= 0 || newRng > 500) {
+        newRad < 1 || newRad > MAX_SEARCH_NM || newRng < RANGE_MIN || newRng > RANGE_MAX) {
       server.send(400, "text/plain", "Invalid values");
       return;
     }
 
-    // Atomically update
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     homeLat = newLat;
     homeLon = newLon;
-    searchRadiusDeg = newRad;
-    radarMaxKm = newRng;
+    searchRadiusNm = newRad;
+    radarRange = newRng;
     if (configMutex) xSemaphoreGive(configMutex);
 
-    // Persist to NVS
     prefs.putDouble("lat", newLat);
     prefs.putDouble("lon", newLon);
-    prefs.putDouble("radius", newRad);
-    prefs.putFloat("range", newRng);
+    prefs.putFloat("radius_nm", newRad);
+    prefs.putFloat("range_u", newRng);
 
-    Serial.printf("Config saved: lat=%.6f lon=%.6f radius=%.4f range=%.1f\n",
-                  newLat, newLon, newRad, newRng);
+    Serial.printf("Config saved: lat=%.6f lon=%.6f radius=%.0f nm range=%.0f %s\n",
+                  newLat, newLon, newRad, newRng, DIST_UNIT);
     server.send(200, "text/plain", "OK");
   });
 
@@ -855,15 +968,15 @@ function save(e){
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  
+
   touchSpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, -1);
-  ts.begin(touchSpi); 
+  ts.begin(touchSpi);
   ts.setRotation(1);
 
   tft.begin();
-  tft.setRotation(1); 
-  tft.invertDisplay(false); 
-  
+  tft.setRotation(1);
+  tft.invertDisplay(DISPLAY_INVERT);
+
   radarSpr.setColorDepth(16);
   radarSpr.createSprite(200, 200);
 
@@ -872,7 +985,7 @@ void setup() {
   tft.drawString("CYD PLANE SPOTTER", 20, 100);
   delay(1500);
 
-  for (int i=0; i<15; i++) routeCache[i].valid = false;
+  for (int i = 0; i < ROUTE_CACHE_SIZE; i++) routeCache[i].valid = false;
 
   connectWiFi();
   configTime(0, 0, "pool.ntp.org", "time.google.com");
@@ -880,22 +993,21 @@ void setup() {
 
   nearest.valid = false;
   newDataReady = false;
-  fetchInProgress = false;
 
-  // Load persisted config (or use defaults)
+  // Load persisted config (or use defaults).
+  // New keys: older firmware stored the radius in degrees and the range in km.
   prefs.begin("cyd-spotter", false);
   homeLat = prefs.getDouble("lat", homeLat);
   homeLon = prefs.getDouble("lon", homeLon);
-  searchRadiusDeg = prefs.getDouble("radius", searchRadiusDeg);
-  radarMaxKm = prefs.getFloat("range", radarMaxKm);
-  Serial.printf("Config loaded: lat=%.6f lon=%.6f radius=%.4f range=%.1f\n",
-                homeLat, homeLon, searchRadiusDeg, radarMaxKm);
+  searchRadiusNm = constrain(prefs.getFloat("radius_nm", searchRadiusNm), 1.0f, MAX_SEARCH_NM);
+  radarRange = constrain(prefs.getFloat("range_u", radarRange), RANGE_MIN, RANGE_MAX);
+  Serial.printf("Config loaded: lat=%.6f lon=%.6f radius=%.0f nm range=%.0f %s\n",
+                homeLat, homeLon, searchRadiusNm, radarRange, DIST_UNIT);
 
   // Create mutexes before the task (task uses them)
   dataMutex = xSemaphoreCreateMutex();
   configMutex = xSemaphoreCreateMutex();
 
-  // Start web config server
   initWebServer();
 
   // Launch background fetcher on Core 0 (Core 1 = Arduino loop)
@@ -911,28 +1023,11 @@ void setup() {
 }
 
 void loop() {
-  uint32_t now = millis();
-
   // WiFi health — reconnect if needed (draws to TFT so must be Core 1)
   if (WiFi.status() != WL_CONNECTED) connectWiFi();
 
-  // Weather fetch still runs in loop (it's infrequent, every 10 min)
-  if (!firstWeatherDone || now - lastWeatherPoll >= WEATHER_INTERVAL_MS) {
-    if (WiFi.status() == WL_CONNECTED) fetchWeather();
-    lastWeatherPoll = now; firstWeatherDone = true;
-  }
-
   checkTouch();
-
-  // Serve web config requests
   server.handleClient();
-
-  // Auto-screen rotation (re-enabled)
-  //if (now - lastScreenSwap >= SCREEN_SWAP_MS) {
-  //  screen = (screen + 1) % NUM_SCREENS;
-  //  lastScreenSwap = now;
-  //}
-
   render();
   delay(33);
 }
