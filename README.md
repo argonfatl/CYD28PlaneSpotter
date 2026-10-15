@@ -17,12 +17,15 @@ A real-time aircraft tracker for the **ESP32 Cheap Yellow Display (CYD)** that r
 
 ## Hardware
 
-Both CYD variants are supported — pick the matching PlatformIO environment:
+CYD boards ship with different display controllers, so there are three builds. The USB ports are only a hint; the firmware logs the panel ID at boot (`0xD3: xx 93 41` = ILI9341, `0x04: 85 85 52` = ST7789), and at power-on the screen flashes red/green/blue if the build matches.
 
-| Variant | How to recognize | Panel | PlatformIO env |
-|---------|------------------|-------|----------------|
-| ESP32-2432S028R (original) | one micro-USB port | ILI9341 | `cyd` (default) |
-| ESP32-2432S028R "CYD2USB" | micro-USB **and** USB-C | ST7789 | `cyd2usb` |
+| Board | Panel | PlatformIO env |
+|-------|-------|----------------|
+| ESP32-2432S028R, one micro-USB | ILI9341 | `cyd` (default) |
+| ESP32-2432S028R, micro-USB + USB-C, panel label HSD028309 | ILI9341 | `cyd-alt` |
+| ESP32-2432S028R "CYD2USB", micro-USB + USB-C | ST7789 | `cyd2usb` |
+
+If the screen stays white or black after flashing, try the next build. If colors look inverted, add `-D DISPLAY_INVERT=1` to that environment's `build_flags`.
 
 - **Touch**: XPT2046 resistive touch controller
 - **RGB LED** (back side): red GPIO4, green GPIO16, blue GPIO17, active LOW
@@ -74,15 +77,16 @@ CYD28/
    ```
 4. **Build & upload** for your board variant:
    ```
-   pio run -e cyd -t upload        # single micro-USB
-   pio run -e cyd2usb -t upload    # micro-USB + USB-C
+   pio run -e cyd -t upload        # see the table above for which env
+   pio run -e cyd-alt -t upload
+   pio run -e cyd2usb -t upload
    ```
 5. **WiFi setup** (if no credentials in `config.env`): the screen shows instructions and a QR code. Scan it with your phone camera to join the `PlaneSpotter-Setup` network (or join it manually); the setup page opens by itself (or browse to `http://192.168.4.1`). Tap *Configure WiFi*, choose your network, enter the password and optionally your city (or `lat,lon`), and save. If nothing happens for 5 minutes the device restarts and tries again.
 6. Once connected, the web address is shown on the Settings screen; open it in a browser to change settings live.
 
 ### Flashing a prebuilt image (no PlatformIO)
 
-Every pull request and push to `master` is built by GitHub Actions. Open the run on the **Actions** tab and download `firmware-cyd` or `firmware-cyd2usb`. Flash `<env>-merged.bin` at offset **0x0** with [ESP Tool](https://espressif.github.io/esptool-js/) in Chrome or Edge: *Connect*, pick the board's serial port, set *Flash Address* to `0x0`, choose the file, *Program*. WiFi and location are then set up through the setup portal.
+Every pull request and push to `master` is built by GitHub Actions. Open the run on the **Actions** tab and download the `firmware-<env>` artifact for your board. Flash `<env>-merged.bin` at offset **0x0** with [ESP Tool](https://espressif.github.io/esptool-js/) in Chrome or Edge: *Connect*, pick the board's serial port, set *Flash Address* to `0x0`, choose the file, *Program*. WiFi and location are then set up through the setup portal.
 
 ## Usage
 

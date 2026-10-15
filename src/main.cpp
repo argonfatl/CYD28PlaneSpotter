@@ -1767,7 +1767,7 @@ void setup() {
   // Quick visible self-test: red, green, blue. If these don't show up
   // (screen stays white or black), this build's driver doesn't match the panel.
   const uint16_t testColors[] = {TFT_RED, TFT_GREEN, TFT_BLUE};
-  for (uint16_t c : testColors) { tft.fillScreen(c); delay(400); }
+  for (uint16_t c : testColors) { tft.fillScreen(c); delay(150); }
 
   radarSpr.setColorDepth(16);
   radarSpr.createSprite(200, 200);
