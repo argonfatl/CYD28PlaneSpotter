@@ -1691,9 +1691,22 @@ void setup() {
   ts.begin(touchSpi);
   ts.setRotation(1);
 
+  Serial.println();
+  Serial.println("=== CYD Plane Spotter boot ===");
+#if defined(ST7789_DRIVER)
+  Serial.println("Display driver: ST7789 (env cyd2usb)");
+#else
+  Serial.println("Display driver: ILI9341 (env cyd)");
+#endif
   tft.begin();
   tft.setRotation(1);
   tft.invertDisplay(DISPLAY_INVERT);
+
+  // Identify the panel controller: ILI9341 answers 0xD3 with 00 93 41,
+  // ST7789 answers 0x04 with 85 85 52. Helps pick the right firmware.
+  Serial.printf("Panel ID 0x04: %02X %02X %02X   0xD3: %02X %02X %02X\n",
+                tft.readcommand8(0x04, 1), tft.readcommand8(0x04, 2), tft.readcommand8(0x04, 3),
+                tft.readcommand8(0xD3, 1), tft.readcommand8(0xD3, 2), tft.readcommand8(0xD3, 3));
 
   radarSpr.setColorDepth(16);
   radarSpr.createSprite(200, 200);
