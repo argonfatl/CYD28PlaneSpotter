@@ -2,6 +2,7 @@ name: Build firmware
 
 on:
   push:
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -32,7 +33,19 @@ jobs:
         run: pip install --upgrade platformio
 
       - name: Build ${{ matrix.env }}
-        run: pio run -e ${{ matrix.env }}
+        run: |
+          set -o pipefail
+          pio run -e ${{ matrix.env }} 2>&1 | tee build.log
+
+      # Surface memory usage and our own compiler warnings as annotations
+      - name: Report size and warnings
+        if: always()
+        run: |
+          grep -E "^(RAM|Flash):" build.log | while read -r l; do echo "::notice title=${{ matrix.env }} size::$l"; done
+          grep -E "^(src|lib)/[^:]+:[0-9]+:[0-9]+: warning:" build.log | sort -u | head -40 | while IFS= read -r l; do
+            f=${l%%:*}; rest=${l#*:}; line=${rest%%:*}
+            echo "::warning file=$f,line=$line::${l#*warning: }"
+          done
 
       # One image that can be flashed at offset 0x0 with any tool,
       # e.g. https://espressif.github.io/esptool-js/ — no PlatformIO needed
