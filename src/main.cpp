@@ -24,6 +24,7 @@
 #include <cydqr.h>
 #include <TJpg_Decoder.h>
 #include <math.h>
+#include <algorithm>
 #include <time.h>
 #include <sys/time.h>
 #include <freertos/FreeRTOS.h>
@@ -243,8 +244,18 @@ uint32_t lastScreenSwap = 0;
 uint32_t lastTouchMs = 0;
 uint32_t wifiConfirmUntil = 0;   // "WiFi setup" needs a second tap within 3 s
 volatile bool portalRequested = false;
-const uint8_t NUM_SCREENS = 5;
-const uint8_t SCREEN_SETTINGS = 4;
+volatile bool calibrateRequested = false;   // from the settings menu or the web page
+const uint8_t NUM_SCREENS = 4;              // screens cycled by tapping
+const uint8_t SCREEN_SETTINGS = 4;          // settings menu, opened with the gear icon
+uint8_t screenBeforeSettings = 0;
+
+// Touch calibration: screen = affine(raw). Default matches a typical CYD panel.
+float touchCal[6] = {0.0f, -0.086486f, 337.30f,    // sx = a*rx + b*ry + c
+                     -0.064865f, 0.0f, 252.97f};   // sy = d*rx + e*ry + f
+
+// Screen backlight (GPIO21) via LEDC channel 0
+#define BL_CH 0
+uint8_t backlightPct = 100;
 const uint32_t SCREEN_SWAP_MS = 10000;
 
 // ---------------------------------------------------------------------------
@@ -899,20 +910,36 @@ void fmtClock(char* buf, size_t n, bool withSecs) {
   strftime(buf, n, withSecs ? "%H:%M:%S" : "%H:%M", &lt);
 }
 
+// Gear icon in the top-right corner: opens the settings menu
+const int GEAR_X = 304, GEAR_Y = 12;
+void drawGear(uint16_t color) {
+  for (int i = 0; i < 8; i++) {
+    float a = i * PI / 4;
+    tft.fillCircle(GEAR_X + (int)lroundf(cosf(a) * 8), GEAR_Y + (int)lroundf(sinf(a) * 8), 2, color);
+  }
+  tft.fillCircle(GEAR_X, GEAR_Y, 7, color);
+  tft.fillCircle(GEAR_X, GEAR_Y, 3, TFT_BLACK);
+}
+
 void drawHeader(const char* title, bool newPage) {
   tft.setTextFont(2);
+  tft.setTextDatum(TL_DATUM);
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
 
   if (newPage) {
-    char left[30]; snprintf(left, sizeof(left), "%s [%d/%d]", title, screen + 1, NUM_SCREENS);
+    char left[30];
+    if (screen < NUM_SCREENS) snprintf(left, sizeof(left), "%s [%d/%d]", title, screen + 1, NUM_SCREENS);
+    else snprintf(left, sizeof(left), "%s", title);
     tft.setTextPadding(200);
     tft.drawString(left, 10, 5);
     tft.drawLine(0, 25, 320, 25, TFT_DARKGREY);
+    drawGear(screen == SCREEN_SETTINGS ? TFT_ORANGE : TFT_LIGHTGREY);
   }
 
   char t[10]; fmtClock(t, sizeof(t), true);
-  tft.setTextPadding(80);
-  tft.drawString(t, 240, 5);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.setTextPadding(62);
+  tft.drawString(t, 222, 5);
   tft.setTextPadding(0);
 }
 
@@ -1353,81 +1380,86 @@ void screenWeatherSystem(bool newPage) {
   tft.setTextPadding(0);
 }
 
-// Settings screen: WiFi / location info + two touch buttons
-const int SET_BTN_Y = 185, SET_BTN_H = 40;
-const int SET_BTN_WIFI_X = 10, SET_BTN_LOC_X = 165, SET_BTN_W = 145;
+// Settings menu: status lines + 2x3 grid of big buttons
+struct MenuBtn { int x, y, w, h; };
+const MenuBtn MENU_BTNS[6] = {
+  {6, 98, 150, 42},  {164, 98, 150, 42},
+  {6, 146, 150, 42}, {164, 146, 150, 42},
+  {6, 194, 150, 42}, {164, 194, 150, 42},
+};
+enum { MB_WIFI, MB_LOCATE, MB_CALIBRATE, MB_BRIGHT, MB_LED, MB_BACK };
+
+void drawMenuButton(int i, const char* label, uint16_t bg) {
+  const MenuBtn& b = MENU_BTNS[i];
+  tft.fillRoundRect(b.x, b.y, b.w, b.h, 6, bg);
+  tft.setTextFont(2); tft.setTextDatum(MC_DATUM); tft.setTextPadding(0);
+  tft.setTextColor(TFT_WHITE, bg);
+  tft.drawString(label, b.x + b.w / 2, b.y + b.h / 2);
+  tft.setTextDatum(TL_DATUM);
+}
+
+int menuButtonAt(int sx, int sy) {
+  for (int i = 0; i < 6; i++) {
+    const MenuBtn& b = MENU_BTNS[i];
+    if (sx >= b.x - 3 && sx < b.x + b.w + 3 && sy >= b.y - 3 && sy < b.y + b.h + 3) return i;
+  }
+  return -1;
+}
 
 void screenSettings(bool newPage) {
   drawHeader("SETTINGS", newPage);
 
-  double hLat, hLon; float sRad; char name[48];
+  char name[48]; bool ledAlerts;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-  hLat = homeLat; hLon = homeLon; sRad = searchRadiusNm;
-  strcpy(name, homeName);
+  strcpy(name, homeName); ledAlerts = ledCfg.alerts;
   if (configMutex) xSemaphoreGive(configMutex);
 
   char buf[64];
-  tft.setTextFont(2);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextPadding(300);
-
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextFont(2); tft.setTextDatum(TL_DATUM); tft.setTextPadding(306);
   if (WiFi.status() == WL_CONNECTED) {
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
     snprintf(buf, sizeof(buf), "WiFi: %s (%d dBm)", WiFi.SSID().c_str(), WiFi.RSSI());
-    tft.drawString(buf, 10, 34);
+    tft.drawString(buf, 8, 30);
     tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    snprintf(buf, sizeof(buf), "Web: %s.local  or  %s", DEVICE_HOSTNAME, WiFi.localIP().toString().c_str());
-    tft.drawString(buf, 10, 54);
+    snprintf(buf, sizeof(buf), "%s.local  %s", DEVICE_HOSTNAME, WiFi.localIP().toString().c_str());
+    tft.drawString(buf, 8, 46);
   } else {
     tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.drawString("WiFi: not connected", 10, 34);
-    tft.drawString(" ", 10, 54);
+    tft.drawString("WiFi: not connected", 8, 30);
+    tft.drawString(" ", 8, 46);
   }
-
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.drawString("Location:", 10, 80);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString(name, 10, 98);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  snprintf(buf, sizeof(buf), "%.4f, %.4f   search %d NM", hLat, hLon, (int)sRad);
-  tft.drawString(buf, 10, 116);
+  snprintf(buf, sizeof(buf), "Location: %s", name);
+  tft.drawString(buf, 8, 62);
 
-  // LED: last alert (if within 30 min), otherwise what the LED is set to do
-  bool ledAlerts, ledProx;
-  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-  ledAlerts = ledCfg.alerts; ledProx = ledCfg.proximity;
-  if (configMutex) xSemaphoreGive(configMutex);
-  if (lastAlertMs && millis() - lastAlertMs < 30UL * 60 * 1000) {
+  // Status line: recent message, else last LED alert, else firmware version
+  if (statusMsg[0]) {
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK); snprintf(buf, sizeof(buf), "%s", statusMsg);
+  } else if (lastAlertMs && millis() - lastAlertMs < 30UL * 60 * 1000) {
     tft.setTextColor(TFT_ORANGE, TFT_BLACK);
     snprintf(buf, sizeof(buf), "Alert: %s %s %s %.1f%s, %lum ago",
              alertName(lastAlert.kind), lastAlert.callsign, lastAlert.type,
-             toDisplayDist(lastAlert.distKm), DIST_UNIT, (millis() - lastAlertMs) / 60000UL);
+             toDisplayDist(lastAlert.distKm), DIST_UNIT, (unsigned long)((millis() - lastAlertMs) / 60000UL));
   } else {
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    snprintf(buf, sizeof(buf), "LED: alerts %s, distance colors %s",
-             ledAlerts ? "on" : "off", ledProx ? "on" : "off");
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "Firmware %s (%s)", FW_VERSION, BUILD_ENV);
   }
-  tft.drawString(buf, 10, 138);
-
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString(statusMsg[0] ? statusMsg : " ", 10, 160);
+  tft.drawString(buf, 8, 78);
   tft.setTextPadding(0);
 
-  // Buttons: redraw only when their state changes (avoids flicker)
-  static int lastWifiBtn = -1;
-  int wifiBtn = millis() < wifiConfirmUntil ? 1 : 0;
-  if (newPage || wifiBtn != lastWifiBtn) {
-    lastWifiBtn = wifiBtn;
-    tft.setTextDatum(MC_DATUM);
-    tft.fillRoundRect(SET_BTN_WIFI_X, SET_BTN_Y, SET_BTN_W, SET_BTN_H, 6, wifiBtn ? TFT_ORANGE : TFT_DARKGREY);
-    tft.setTextColor(TFT_WHITE, wifiBtn ? TFT_ORANGE : TFT_DARKGREY);
-    tft.drawString(wifiBtn ? "TAP AGAIN" : "WIFI SETUP", SET_BTN_WIFI_X + SET_BTN_W / 2, SET_BTN_Y + SET_BTN_H / 2);
-    if (newPage) {
-      tft.fillRoundRect(SET_BTN_LOC_X, SET_BTN_Y, SET_BTN_W, SET_BTN_H, 6, TFT_DARKGREY);
-      tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-      tft.drawString("LOCATE BY IP", SET_BTN_LOC_X + SET_BTN_W / 2, SET_BTN_Y + SET_BTN_H / 2);
-    }
-    tft.setTextDatum(TL_DATUM);
+  // Buttons: redraw only when a label or state changes (no flicker)
+  static uint32_t lastKey = 0xFFFFFFFF;
+  bool wifiArmed = millis() < wifiConfirmUntil;
+  uint32_t key = (wifiArmed ? 1 : 0) | (ledAlerts ? 2 : 0) | ((uint32_t)backlightPct << 8);
+  if (newPage || key != lastKey) {
+    lastKey = key;
+    drawMenuButton(MB_WIFI, wifiArmed ? "TAP AGAIN" : "WIFI SETUP", wifiArmed ? TFT_ORANGE : C_BLUEB);
+    drawMenuButton(MB_LOCATE, "LOCATE BY IP", C_BLUEB);
+    drawMenuButton(MB_CALIBRATE, "CALIBRATE TOUCH", C_BLUEB);
+    snprintf(buf, sizeof(buf), "BRIGHTNESS %u%%", backlightPct);
+    drawMenuButton(MB_BRIGHT, buf, C_BLUEB);
+    drawMenuButton(MB_LED, ledAlerts ? "LED ALERTS ON" : "LED ALERTS OFF", ledAlerts ? 0x0400 : C_BADGE);
+    drawMenuButton(MB_BACK, "< BACK", C_BADGE);
   }
 }
 
@@ -1704,62 +1736,209 @@ void changeRange(float delta) {
   Serial.printf("Radar range: %d %s\n", (int)r, DIST_UNIT);
 }
 
-void checkTouch() {
-  if (ts.touched()) {
+void setBacklight(uint8_t pct) {
+  backlightPct = pct;
+  ledcWrite(BL_CH, (uint32_t)pct * 255 / 100);
+}
+
+// Raw touch reading: median of 5 samples, rejects light touches and SPI noise
+bool readTouchRaw(int& rx, int& ry) {
+  if (!ts.touched()) return false;
+  int xs[5], ys[5], n = 0;
+  for (int i = 0; i < 5; i++) {
     TS_Point p = ts.getPoint();
+    if (p.z > 400 && p.x > 100 && p.x < 4000 && p.y > 100 && p.y < 4000) { xs[n] = p.x; ys[n] = p.y; n++; }
+  }
+  if (n < 3) return false;
+  std::sort(xs, xs + n); std::sort(ys, ys + n);
+  rx = xs[n / 2]; ry = ys[n / 2];
+  return true;
+}
 
-    // STRICT FILTER:
-    // 1. p.z > 400 ignores light ghost touches and case pinching.
-    // 2. p.x and p.y bounds ignore the 0 and 4095 coordinate spikes caused by SPI noise.
-    if (p.z > 400 && p.x > 100 && p.x < 4000 && p.y > 100 && p.y < 4000) {
+void mapTouch(int rx, int ry, int& sx, int& sy) {
+  sx = constrain((int)lroundf(touchCal[0] * rx + touchCal[1] * ry + touchCal[2]), 0, 319);
+  sy = constrain((int)lroundf(touchCal[3] * rx + touchCal[4] * ry + touchCal[5]), 0, 239);
+}
 
-      if (millis() - lastTouchMs > 400) { // 400ms debounce to prevent double-skips
-        lastTouchMs = millis();
+// Wait for a fresh press (after release) and return its raw median; false on timeout
+bool waitPress(int& rx, int& ry, uint32_t timeoutMs) {
+  uint32_t t0 = millis();
+  while (ts.touched()) { if (millis() - t0 > timeoutMs) return false; delay(10); }   // release first
+  while (millis() - t0 < timeoutMs) {
+    if (readTouchRaw(rx, ry)) {
+      // Average for ~250 ms while held, for a steadier point
+      long sx = 0, sy = 0; int n = 0; uint32_t t1 = millis();
+      int x, y;
+      while (millis() - t1 < 250) { if (readTouchRaw(x, y)) { sx += x; sy += y; n++; } delay(10); }
+      if (n > 0) { rx = sx / n; ry = sy / n; }
+      while (ts.touched()) delay(10);
+      return true;
+    }
+    delay(10);
+  }
+  return false;
+}
 
-        // Map raw touch to screen coordinates (CYD rotation 1)
-        // Calibrated: raw ~200-3900, X-axis inverted for this panel
-        int sx = 320 - (int)((p.y - 200.0f) * 320.0f / 3700.0f);
-        int sy = 240 - (int)((p.x - 200.0f) * 240.0f / 3700.0f);
-        sx = constrain(sx, 0, 319);
-        sy = constrain(sy, 0, 239);
+void drawCross(int x, int y, uint16_t c) {
+  tft.drawFastHLine(x - 12, y, 25, c); tft.drawFastVLine(x, y - 12, 25, c);
+  tft.drawCircle(x, y, 6, c);
+}
 
-        static uint32_t lastDebug = 0;
-        if (millis() - lastDebug > 2000) {
-          Serial.printf("Touch: raw(%d,%d,%d) -> screen(%d,%d)\n", p.x, p.y, p.z, sx, sy);
-          lastDebug = millis();
-        }
+// 3-point touch calibration with a test screen; saved to NVS on SAVE
+void runTouchCalibration() {
+  const int tx[3] = {30, 290, 160}, ty[3] = {30, 120, 212};
+  int rx[3], ry[3];
+  for (;;) {
+    for (int i = 0; i < 3; i++) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextDatum(MC_DATUM); tft.setTextPadding(0); tft.setTextFont(2);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString("TOUCH CALIBRATION", 160, 70);
+      tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+      char m[40]; snprintf(m, sizeof(m), "Tap the center of the cross (%d/3)", i + 1);
+      tft.drawString(m, 160, 92);
+      tft.drawString("Use a stylus or fingernail", 160, 110);
+      tft.setTextDatum(TL_DATUM);
+      drawCross(tx[i], ty[i], TFT_YELLOW);
+      if (!waitPress(rx[i], ry[i], 30000)) {
+        Serial.println("Calibration timed out, keeping the old one");
+        tft.fillScreen(TFT_BLACK); lastScreen = 255; return;
+      }
+      drawCross(tx[i], ty[i], TFT_GREEN);
+      Serial.printf("Cal point %d: screen(%d,%d) raw(%d,%d)\n", i + 1, tx[i], ty[i], rx[i], ry[i]);
+      delay(300);
+    }
 
-        // Radar screen: -/+ range buttons. Hit areas match the drawn buttons,
-        // padded ~8 px because the resistive panel isn't pixel-accurate.
-        if (screen == 2 && sy >= BTN_Y - 10) {
-          if (sx >= BTN_MINUS_X - 8 && sx < BTN_MINUS_X + BTN_W + 5) {
-            changeRange(-RANGE_STEP); lastScreenSwap = millis(); return;
-          }
-          if (sx >= BTN_PLUS_X - 5 && sx <= BTN_PLUS_X + BTN_W + 8) {
-            changeRange(+RANGE_STEP); lastScreenSwap = millis(); return;
-          }
-        }
-
-        // Settings screen buttons (bottom row)
-        if (screen == SCREEN_SETTINGS && sy >= SET_BTN_Y - 10) {
-          if (sx < 160) {
-            // WiFi setup interrupts tracking, so it needs a confirming second tap
-            if (millis() < wifiConfirmUntil) { wifiConfirmUntil = 0; portalRequested = true; }
-            else wifiConfirmUntil = millis() + 3000;
-          } else {
-            if (WiFi.status() == WL_CONNECTED) { setStatus("Locating..."); ipLocateRequested = true; }
-            else setStatus("No WiFi connection");
-          }
-          return;
-        }
-
-        // Default: cycle to next screen
-        screen = (screen + 1) % NUM_SCREENS;
-        wifiConfirmUntil = 0;
-        lastScreenSwap = millis();
+    // Solve sx = a*rx + b*ry + c and sy = d*rx + e*ry + f through the 3 points (Cramer's rule)
+    double det = (double)rx[0] * (ry[1] - ry[2]) - (double)ry[0] * (rx[1] - rx[2]) + ((double)rx[1] * ry[2] - (double)rx[2] * ry[1]);
+    float cal[6];
+    bool ok = fabs(det) > 1000;
+    if (ok) {
+      for (int k = 0; k < 2; k++) {
+        const int* t = k == 0 ? tx : ty;
+        cal[3*k+0] = (float)((t[0] * (ry[1] - ry[2]) - ry[0] * (t[1] - t[2]) + ((double)t[1] * ry[2] - (double)t[2] * ry[1])) / det);
+        cal[3*k+1] = (float)((rx[0] * (t[1] - t[2]) - t[0] * (rx[1] - rx[2]) + ((double)rx[1] * t[2] - (double)rx[2] * t[1])) / det);
+        cal[3*k+2] = (float)((rx[0] * ((double)ry[1] * t[2] - (double)ry[2] * t[1]) - ry[0] * ((double)rx[1] * t[2] - (double)rx[2] * t[1])
+                              + t[0] * ((double)rx[1] * ry[2] - (double)rx[2] * ry[1])) / det);
       }
     }
+    if (!ok) {
+      tft.fillScreen(TFT_BLACK); tft.setTextDatum(MC_DATUM); tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.drawString("Points too close - let's try again", 160, 120); tft.setTextDatum(TL_DATUM);
+      delay(1500); continue;
+    }
+
+    // Test screen: dots where you tap; SAVE or REDO
+    float old[6]; memcpy(old, touchCal, sizeof(old));
+    memcpy(touchCal, cal, sizeof(cal));
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM); tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextFont(2);
+    tft.drawString("Tap anywhere to test - dots show where", 160, 20);
+    tft.drawString("Then press SAVE (or REDO)", 160, 38);
+    tft.fillRoundRect(10, 190, 140, 42, 6, C_BADGE);  tft.setTextColor(TFT_WHITE, C_BADGE);  tft.drawString("REDO", 80, 211);
+    tft.fillRoundRect(170, 190, 140, 42, 6, 0x0400);  tft.setTextColor(TFT_WHITE, 0x0400);  tft.drawString("SAVE", 240, 211);
+    tft.setTextDatum(TL_DATUM);
+    int result = 0;   // 1 save, 2 redo, 0 timeout
+    uint32_t t0 = millis();
+    while (!result && millis() - t0 < 60000) {
+      int x, y, sx, sy;
+      if (!waitPress(x, y, 1000)) continue;
+      mapTouch(x, y, sx, sy);
+      t0 = millis();
+      if (sy >= 186 && sx < 155) result = 2;
+      else if (sy >= 186 && sx >= 165) result = 1;
+      else tft.fillCircle(sx, sy, 3, TFT_GREEN);
+    }
+    if (result == 1) {
+      prefs.putBytes("tcal", touchCal, sizeof(touchCal));
+      Serial.printf("Touch calibration saved: %.5f %.5f %.2f / %.5f %.5f %.2f\n",
+                    touchCal[0], touchCal[1], touchCal[2], touchCal[3], touchCal[4], touchCal[5]);
+      setStatus("Touch calibrated");
+      break;
+    }
+    if (result == 0) { memcpy(touchCal, old, sizeof(old)); break; }   // timed out: keep old
+    memcpy(touchCal, old, sizeof(old));                               // redo
   }
+  tft.fillScreen(TFT_BLACK);
+  lastScreen = 255;
+}
+
+void openSettings() {
+  if (screen != SCREEN_SETTINGS) screenBeforeSettings = screen;
+  screen = SCREEN_SETTINGS;
+  statusMsg[0] = '\0';
+  wifiConfirmUntil = 0;
+}
+
+void handleMenuButton(int b) {
+  switch (b) {
+    case MB_WIFI:
+      // WiFi setup interrupts tracking, so it needs a confirming second tap
+      if (millis() < wifiConfirmUntil) { wifiConfirmUntil = 0; portalRequested = true; }
+      else wifiConfirmUntil = millis() + 3000;
+      break;
+    case MB_LOCATE:
+      if (WiFi.status() == WL_CONNECTED) { setStatus("Locating..."); ipLocateRequested = true; }
+      else setStatus("No WiFi connection");
+      break;
+    case MB_CALIBRATE:
+      calibrateRequested = true;
+      break;
+    case MB_BRIGHT: {
+      static const uint8_t levels[] = {100, 60, 30, 10};
+      int k = 0; while (k < 4 && levels[k] != backlightPct) k++;
+      setBacklight(levels[(k + 1) % 4]);
+      prefs.putUChar("bl", backlightPct);
+      break;
+    }
+    case MB_LED:
+      if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+      ledCfg.alerts = !ledCfg.alerts;
+      prefs.putBool("led_alert", ledCfg.alerts);
+      if (configMutex) xSemaphoreGive(configMutex);
+      break;
+    case MB_BACK:
+      screen = screenBeforeSettings;
+      break;
+  }
+}
+
+// Acts once per press (on touch-down), using the calibrated mapping
+void checkTouch() {
+  static bool wasDown = false;
+  int rx, ry;
+  bool down = readTouchRaw(rx, ry);
+  if (!down) { if (!ts.touched()) wasDown = false; return; }
+  if (wasDown) return;                       // still the same press
+  wasDown = true;
+  if (millis() - lastTouchMs < 150) return;  // bounce
+  lastTouchMs = millis();
+
+  int sx, sy;
+  mapTouch(rx, ry, sx, sy);
+  Serial.printf("Touch: raw(%d,%d) -> screen(%d,%d)\n", rx, ry, sx, sy);
+
+  // Gear icon (generous hit area in the top-right corner)
+  if (sy < 34 && sx >= 270) {
+    if (screen == SCREEN_SETTINGS) screen = screenBeforeSettings; else openSettings();
+    return;
+  }
+
+  if (screen == SCREEN_SETTINGS) {
+    int b = menuButtonAt(sx, sy);
+    if (b >= 0) handleMenuButton(b);
+    return;                                  // taps elsewhere on the menu do nothing
+  }
+
+  // Radar screen: -/+ range buttons
+  if (screen == 2 && sy >= BTN_Y - 10) {
+    if (sx >= BTN_MINUS_X - 8 && sx < BTN_MINUS_X + BTN_W + 5) { changeRange(-RANGE_STEP); return; }
+    if (sx >= BTN_PLUS_X - 5 && sx <= BTN_PLUS_X + BTN_W + 8) { changeRange(+RANGE_STEP); return; }
+  }
+
+  // Anywhere else: next screen
+  screen = (screen + 1) % NUM_SCREENS;
+  lastScreenSwap = millis();
 }
 
 // ---------------------------------------------------------------------------
@@ -1941,6 +2120,7 @@ void initWebServer() {
   <progress id="fwp" max="100" value="0" style="width:100%;margin-top:10px;display:none"></progress>
   <div id="fws" class="hint"></div>
   <button type="button" onclick="upload()">Update firmware</button>
+  <button type="button" class="opt" style="text-align:center" onclick="post('/calibrate','',function(){flash('Calibration started on the device screen')})">Calibrate touch screen</button>
 </div>
 <div class="card">
   <h2>WiFi</h2>
@@ -2118,6 +2298,12 @@ function forget(){
   const char* hdrs[] = {"Content-Length"};
   server.collectHeaders(hdrs, 1);
 
+  // POST /calibrate — run touch calibration on the device
+  server.on("/calibrate", HTTP_POST, []() {
+    calibrateRequested = true;
+    server.send(200, "text/plain", "OK");
+  });
+
   // POST /wifi-reset — forget saved WiFi and reboot into the setup portal
   server.on("/wifi-reset", HTTP_POST, []() {
     server.send(200, "text/plain", "OK");
@@ -2207,8 +2393,19 @@ void setup() {
   PREF("led_range", getFloat, ledCfg.alertRange);
   PREF("led_bright", getUChar, ledCfg.brightness);
   if (prefs.isKey("led_watch")) copyAscii(ledCfg.watch, prefs.getString("led_watch").c_str(), sizeof(ledCfg.watch));
+  PREF("bl", getUChar, backlightPct);
   #undef PREF
   ledInit();
+
+  // Backlight on GPIO21 through PWM (TFT_eSPI only switches it on)
+  ledcSetup(BL_CH, 5000, 8);
+  ledcAttachPin(TFT_BL, BL_CH);
+  setBacklight(constrain(backlightPct, (uint8_t)10, (uint8_t)100));
+
+  // Touch calibration: load it, or run it on first boot / when the screen is held at power-on
+  bool haveCal = prefs.isKey("tcal") && prefs.getBytesLength("tcal") == sizeof(touchCal);
+  if (haveCal) prefs.getBytes("tcal", touchCal, sizeof(touchCal));
+  if (!haveCal || ts.touched()) runTouchCalibration();
 
   connectWiFiAtBoot();
   configTime(0, 0, "pool.ntp.org", "time.google.com");
@@ -2238,6 +2435,10 @@ void loop() {
   if (portalRequested) {
     portalRequested = false;
     runWifiPortal(true);
+  }
+  if (calibrateRequested) {
+    calibrateRequested = false;
+    runTouchCalibration();
   }
 
   server.handleClient();

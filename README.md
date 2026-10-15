@@ -98,8 +98,9 @@ After the first USB flash, updates don't need a cable:
 
 ## Usage
 
-- **Tap the screen** to cycle through the 5 screens.
-- **On the Settings screen**: *WiFi setup* (tap twice to confirm) reopens the setup portal to switch networks; *Locate by IP* sets an approximate location automatically.
+- **Tap the screen** to cycle through the 4 main screens. The **gear icon** (top right) opens the settings menu.
+- **Settings menu**: *WiFi setup* (tap twice to confirm) reopens the setup portal; *Locate by IP* sets an approximate location; *Calibrate touch* runs a 3-point touch calibration with a test screen; *Brightness* cycles 100/60/30/10 %; *LED alerts* toggles the back LED alerts.
+- **Touch calibration** runs automatically on first boot. If touches ever land in the wrong place, hold a finger on the screen while powering on, or use *Calibrate touch screen* on the web page.
 - **Changing networks from the browser**: *Forget WiFi & restart* on the web page erases the saved network and reboots into the setup portal. (Credentials hard-coded in `config.env` are always tried first.)
 - **On the Radar screen**, tap the **−/+ buttons** at the bottom-left to adjust range (5–150 mi in 5 mi steps, or 10–250 km when metric).
 - **Back LED** settings are on the web page: distance colors, which aircraft trigger a blink, the alert range, the watch list (e.g. `B52, C17, A388, N911`) and brightness, plus a *Test LED* button. The last alert is shown on the Settings screen.
