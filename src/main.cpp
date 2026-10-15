@@ -930,7 +930,7 @@ void screenRadar(bool newPage) {
       if (ly > 192) ly = 192;
       radarSpr.drawString(blips[i].callsign, lx, ly);
 
-      char flBuf[10];
+      char flBuf[16];
       snprintf(flBuf, sizeof(flBuf), "FL%03d", (blips[i].altFt + 50) / 100);
       int ly2 = ly + 8;
       if (ly2 > 192) ly2 = 192;
@@ -998,7 +998,8 @@ void screenWeatherSystem(bool newPage) {
 
   char bufSys[64];
   uint32_t up = millis() / 1000;
-  snprintf(bufSys, sizeof(bufSys), "Uptime: %02lu:%02lu:%02lu", up / 3600, (up % 3600) / 60, up % 60);
+  snprintf(bufSys, sizeof(bufSys), "Uptime: %02lu:%02lu:%02lu",
+           (unsigned long)(up / 3600), (unsigned long)((up % 3600) / 60), (unsigned long)(up % 60));
   tft.drawString(bufSys, 20, 130);
 
   snprintf(bufSys, sizeof(bufSys), "WiFi RSSI: %d dBm", WiFi.RSSI());
@@ -1011,7 +1012,8 @@ void screenWeatherSystem(bool newPage) {
   tft.drawString(bufSys, 180, 160);
 
   tft.setTextPadding(300);
-  snprintf(bufSys, sizeof(bufSys), "API Req: %lu OK / %lu FAIL", stats.requestsOk, stats.requestsFail);
+  snprintf(bufSys, sizeof(bufSys), "API Req: %lu OK / %lu FAIL",
+           (unsigned long)stats.requestsOk, (unsigned long)stats.requestsFail);
   tft.drawString(bufSys, 20, 190);
 
   tft.setTextPadding(0);
