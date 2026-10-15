@@ -270,26 +270,44 @@ double toDisplayDist(double km) { return km / KM_PER_UNIT; }
 // ---------------------------------------------------------------------------
 // GET a URL and stream-parse the JSON body (no full-payload String in RAM).
 // Returns the HTTP status code, or a negative value on connection/parse failure.
-int httpGetJson(const String& url, JsonDocument& doc, JsonDocument* filter) {
+// If err is given, a short reason is written there on failure.
+int httpGetJson(const String& url, JsonDocument& doc, JsonDocument* filter,
+                char* err = nullptr, size_t errLen = 0) {
   WiFiClientSecure secureClient; secureClient.setInsecure();
   WiFiClient plainClient;
   WiFiClient& client = url.startsWith("https://") ? (WiFiClient&)secureClient : plainClient;
   HTTPClient https;
   https.setReuse(false);
   https.useHTTP10(true);   // no chunked encoding -> getStream() is plain JSON
-  https.setTimeout(10000);
-  if (!https.begin(client, url)) return -1;
-  https.addHeader("User-Agent", "CYD28PlaneSpotter/1.1");
+  https.setTimeout(15000);
+  // NB: addHeader("User-Agent", ...) is silently ignored by HTTPClient; without this
+  // the request goes out as "ESP32HTTPClient", which some APIs reject.
+  https.setUserAgent("CYD28PlaneSpotter/1.2 (+https://github.com/argonfatl/CYD28PlaneSpotter)");
+  if (!https.begin(client, url)) {
+    if (err) snprintf(err, errLen, "begin failed");
+    return -1;
+  }
 
   int code = https.GET();
-  if (code != HTTP_CODE_OK) { https.end(); return code; }
+  if (code != HTTP_CODE_OK) {
+    if (code < 0) {
+      Serial.printf("HTTP error %d (%s): %s\n", code, https.errorToString(code).c_str(), url.c_str());
+      if (err) snprintf(err, errLen, "%s", https.errorToString(code).c_str());
+    } else {
+      Serial.printf("HTTP %d: %s\n", code, url.c_str());
+      if (err) snprintf(err, errLen, "HTTP %d", code);
+    }
+    https.end();
+    return code;
+  }
 
-  DeserializationError err = filter
+  DeserializationError jerr = filter
       ? deserializeJson(doc, https.getStream(), DeserializationOption::Filter(*filter))
       : deserializeJson(doc, https.getStream());
   https.end();
-  if (err) {
-    Serial.printf("JSON error (%s): %s\n", err.c_str(), url.c_str());
+  if (jerr) {
+    Serial.printf("JSON error (%s): %s\n", jerr.c_str(), url.c_str());
+    if (err) snprintf(err, errLen, "JSON %s", jerr.c_str());
     return -2;
   }
   return code;
@@ -449,6 +467,23 @@ bool getRoute(Aircraft& a) {
   return a.dep[0] != '\0';
 }
 
+// Aircraft data sources (all free, keyless, readsb JSON format), tried in order
+struct Source { const char* name; const char* fmt; };
+const Source SOURCES[] = {
+  {"airplanes.live", "https://api.airplanes.live/v2/point/%.4f/%.4f/%d"},
+  {"adsb.lol",       "https://api.adsb.lol/v2/point/%.4f/%.4f/%d"},
+  {"adsb.fi",        "https://opendata.adsb.fi/api/v3/lat/%.4f/lon/%.4f/dist/%d"},
+};
+const int NUM_SOURCES = sizeof(SOURCES) / sizeof(SOURCES[0]);
+volatile int activeSource = 0;      // index of the last source that worked
+char lastFetchErr[48] = "";         // last aircraft fetch error, for the status screen
+
+String sourceUrl(int i, double lat, double lon, int radiusNm) {
+  char buf[128];
+  snprintf(buf, sizeof(buf), SOURCES[i].fmt, lat, lon, radiusNm);
+  return String(buf);
+}
+
 // Watch list: comma/space separated tokens; a token matches the ICAO type code
 // exactly (e.g. "B52") or the start of the callsign (e.g. "N911", "RCH")
 struct WatchList {
@@ -496,33 +531,43 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   double alertKm = lc.alertRange * KM_PER_UNIT;
   alertOut = AlertInfo();
 
-  String url = "https://api.airplanes.live/v2/point/" + String(hLat, 4) + "/" +
-               String(hLon, 4) + "/" + String((int)ceilf(sRadNm));
-
-  // Keep only the fields we use — near a big airport the raw payload is large
+  // Keep only the fields we use — near a big airport the raw payload is large.
+  // The sources use the same readsb format; the array is "ac" (some use "aircraft").
   JsonDocument filter;
-  filter["ac"][0]["flight"]    = true;
-  filter["ac"][0]["r"]         = true;
-  filter["ac"][0]["t"]         = true;
-  filter["ac"][0]["lat"]       = true;
-  filter["ac"][0]["lon"]       = true;
-  filter["ac"][0]["alt_baro"]  = true;
-  filter["ac"][0]["alt_geom"]  = true;
-  filter["ac"][0]["gs"]        = true;
-  filter["ac"][0]["track"]     = true;
-  filter["ac"][0]["baro_rate"] = true;
-  filter["ac"][0]["geom_rate"] = true;
-  filter["ac"][0]["category"]  = true;
-  filter["ac"][0]["dbFlags"]   = true;
+  for (const char* key : {"ac", "aircraft"}) {
+    JsonObject f = filter[key].add<JsonObject>();
+    for (const char* fld : {"flight", "r", "t", "lat", "lon", "alt_baro", "alt_geom", "gs",
+                            "track", "baro_rate", "geom_rate", "category", "dbFlags"})
+      f[fld] = true;
+  }
 
+  // Try the last source that worked first, then the others
   JsonDocument doc;
-  if (httpGetJson(url, doc, &filter) != HTTP_CODE_OK) { stats.requestsFail++; return false; }
+  bool ok = false;
+  int start = activeSource;
+  for (int k = 0; k < NUM_SOURCES && !ok; k++) {
+    int i = (start + k) % NUM_SOURCES;
+    String url = sourceUrl(i, hLat, hLon, (int)ceilf(sRadNm));
+    char err[40] = "";
+    doc.clear();
+    if (httpGetJson(url, doc, &filter, err, sizeof(err)) == HTTP_CODE_OK) {
+      ok = true;
+      activeSource = i;
+      lastFetchErr[0] = '\0';
+    } else {
+      snprintf(lastFetchErr, sizeof(lastFetchErr), "%s: %s", SOURCES[i].name, err);
+      Serial.printf("Aircraft source %s failed: %s\n", SOURCES[i].name, err);
+    }
+  }
+  if (!ok) { stats.requestsFail++; return false; }
+
+  JsonArray acList = doc["ac"].is<JsonArray>() ? doc["ac"].as<JsonArray>() : doc["aircraft"].as<JsonArray>();
 
   uint16_t count = 0;
   blipCntOut = 0;
   top5CntOut = 0;
 
-  for (JsonObject s : doc["ac"].as<JsonArray>()) {
+  for (JsonObject s : acList) {
     if (!s["lat"].is<double>() || !s["lon"].is<double>()) continue;
 
     // Skip aircraft on the ground (alt_baro == "ground") — only track those in flight
@@ -1015,6 +1060,15 @@ void screenWeatherSystem(bool newPage) {
   snprintf(bufSys, sizeof(bufSys), "API Req: %lu OK / %lu FAIL",
            (unsigned long)stats.requestsOk, (unsigned long)stats.requestsFail);
   tft.drawString(bufSys, 20, 190);
+
+  if (lastFetchErr[0]) {
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    snprintf(bufSys, sizeof(bufSys), "Err %s", lastFetchErr);
+  } else {
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    snprintf(bufSys, sizeof(bufSys), "Source: %s", SOURCES[activeSource].name);
+  }
+  tft.drawString(bufSys, 20, 212);
 
   tft.setTextPadding(0);
 }
