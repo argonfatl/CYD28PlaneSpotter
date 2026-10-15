@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        env: [cyd, cyd2usb]
+        env: [cyd, cyd-alt, cyd2usb]
 
     steps:
       - uses: actions/checkout@v4

@@ -1695,8 +1695,10 @@ void setup() {
   Serial.println("=== CYD Plane Spotter boot ===");
 #if defined(ST7789_DRIVER)
   Serial.println("Display driver: ST7789 (env cyd2usb)");
+#elif defined(ILI9341_2_DRIVER)
+  Serial.println("Display driver: ILI9341_2 (env cyd)");
 #else
-  Serial.println("Display driver: ILI9341 (env cyd)");
+  Serial.println("Display driver: ILI9341 (env cyd-alt)");
 #endif
   tft.begin();
   tft.setRotation(1);
@@ -1707,6 +1709,11 @@ void setup() {
   Serial.printf("Panel ID 0x04: %02X %02X %02X   0xD3: %02X %02X %02X\n",
                 tft.readcommand8(0x04, 1), tft.readcommand8(0x04, 2), tft.readcommand8(0x04, 3),
                 tft.readcommand8(0xD3, 1), tft.readcommand8(0xD3, 2), tft.readcommand8(0xD3, 3));
+
+  // Quick visible self-test: red, green, blue. If these don't show up
+  // (screen stays white or black), this build's driver doesn't match the panel.
+  const uint16_t testColors[] = {TFT_RED, TFT_GREEN, TFT_BLUE};
+  for (uint16_t c : testColors) { tft.fillScreen(c); delay(400); }
 
   radarSpr.setColorDepth(16);
   radarSpr.createSprite(200, 200);
@@ -1721,23 +1728,29 @@ void setup() {
   // Load persisted config (or use defaults) before WiFi setup, which may change the location.
   // New keys: older firmware stored the radius in degrees and the range in km.
   prefs.begin("cyd-spotter", false);
-  homeLat = prefs.getDouble("lat", homeLat);
-  homeLon = prefs.getDouble("lon", homeLon);
-  copyAscii(homeName, prefs.getString("name", homeName).c_str(), sizeof(homeName));
-  searchRadiusNm = constrain(prefs.getFloat("radius_nm", searchRadiusNm), 1.0f, MAX_SEARCH_NM);
-  radarRange = constrain(prefs.getFloat("range_u", radarRange), RANGE_MIN, RANGE_MAX);
+  // Read only keys that exist: the ESP32 Preferences library logs an error for
+  // every missing key, which floods the serial log on first boot.
+  #define PREF(key, getter, var) if (prefs.isKey(key)) var = prefs.getter(key, var)
+  PREF("lat", getDouble, homeLat);
+  PREF("lon", getDouble, homeLon);
+  if (prefs.isKey("name")) copyAscii(homeName, prefs.getString("name").c_str(), sizeof(homeName));
+  PREF("radius_nm", getFloat, searchRadiusNm);
+  PREF("range_u", getFloat, radarRange);
+  searchRadiusNm = constrain(searchRadiusNm, 1.0f, MAX_SEARCH_NM);
+  radarRange = constrain(radarRange, RANGE_MIN, RANGE_MAX);
   Serial.printf("Config loaded: %s lat=%.6f lon=%.6f radius=%.0f nm range=%.0f %s\n",
                 homeName, homeLat, homeLon, searchRadiusNm, radarRange, DIST_UNIT);
 
-  ledCfg.proximity   = prefs.getBool("led_prox", ledCfg.proximity);
-  ledCfg.alerts      = prefs.getBool("led_alert", ledCfg.alerts);
-  ledCfg.heli        = prefs.getBool("led_heli", ledCfg.heli);
-  ledCfg.military    = prefs.getBool("led_mil", ledCfg.military);
-  ledCfg.interesting = prefs.getBool("led_intr", ledCfg.interesting);
-  ledCfg.lowAltFt    = prefs.getInt("led_lowalt", ledCfg.lowAltFt);
-  ledCfg.alertRange  = prefs.getFloat("led_range", ledCfg.alertRange);
-  ledCfg.brightness  = prefs.getUChar("led_bright", ledCfg.brightness);
-  copyAscii(ledCfg.watch, prefs.getString("led_watch", "").c_str(), sizeof(ledCfg.watch));
+  PREF("led_prox", getBool, ledCfg.proximity);
+  PREF("led_alert", getBool, ledCfg.alerts);
+  PREF("led_heli", getBool, ledCfg.heli);
+  PREF("led_mil", getBool, ledCfg.military);
+  PREF("led_intr", getBool, ledCfg.interesting);
+  PREF("led_lowalt", getInt, ledCfg.lowAltFt);
+  PREF("led_range", getFloat, ledCfg.alertRange);
+  PREF("led_bright", getUChar, ledCfg.brightness);
+  if (prefs.isKey("led_watch")) copyAscii(ledCfg.watch, prefs.getString("led_watch").c_str(), sizeof(ledCfg.watch));
+  #undef PREF
   ledInit();
 
   connectWiFiAtBoot();
