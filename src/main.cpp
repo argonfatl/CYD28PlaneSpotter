@@ -18,6 +18,9 @@
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <WiFiManager.h>
+#include <Update.h>
+#include <ArduinoOTA.h>
+#include <ESPmDNS.h>
 #include <cydqr.h>
 #include <math.h>
 #include <time.h>
@@ -40,6 +43,15 @@
 #endif
 #ifndef WIFI_PASS
 #define WIFI_PASS ""
+#endif
+#ifndef FW_VERSION
+#define FW_VERSION "dev"          // CI sets this to the commit hash
+#endif
+#ifndef BUILD_ENV
+#define BUILD_ENV "custom"
+#endif
+#ifndef DEVICE_HOSTNAME
+#define DEVICE_HOSTNAME "planespotter"   // http://planespotter.local
 #endif
 #ifndef SETUP_AP_NAME
 #define SETUP_AP_NAME "PlaneSpotter-Setup"
@@ -105,6 +117,7 @@ SemaphoreHandle_t configMutex = NULL;  // protects homeLat/Lon/Name/searchRadius
 volatile bool refreshRequested = false;   // skip the rest of the poll wait
 volatile bool ipLocateRequested = false;  // "Locate by IP" button
 char statusMsg[48] = "";                  // one-line feedback on the settings screen
+volatile bool otaActive = false;          // firmware update in progress: pause fetching/drawing
 
 // ---- Back RGB LED (CYD: R=GPIO4, G=GPIO16, B=GPIO17, common anode = active LOW) ----
 #define LED_PIN_R 4
@@ -694,6 +707,7 @@ void dataFetcherTask(void* param) {
   bool weatherDone = false;
 
   for (;;) {
+    if (otaActive) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
     refreshRequested = false;
     if (WiFi.status() == WL_CONNECTED) {
       // "Locate by IP" from the settings screen
@@ -1096,7 +1110,7 @@ void screenSettings(bool newPage) {
     snprintf(buf, sizeof(buf), "WiFi: %s (%d dBm)", WiFi.SSID().c_str(), WiFi.RSSI());
     tft.drawString(buf, 10, 34);
     tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    snprintf(buf, sizeof(buf), "Web settings: http://%s", WiFi.localIP().toString().c_str());
+    snprintf(buf, sizeof(buf), "Web: %s.local  or  %s", DEVICE_HOSTNAME, WiFi.localIP().toString().c_str());
     tft.drawString(buf, 10, 54);
   } else {
     tft.setTextColor(TFT_RED, TFT_BLACK);
@@ -1483,6 +1497,91 @@ void checkTouch() {
 }
 
 // ---------------------------------------------------------------------------
+// Firmware update over WiFi (browser upload and PlatformIO/ArduinoOTA)
+// ---------------------------------------------------------------------------
+void drawOtaScreen(const char* line1, const char* line2, int pct) {
+  static int lastPct = -2;
+  if (pct >= 0 && pct == lastPct) return;   // avoid redrawing on every chunk
+  if (pct < 0 || lastPct < 0) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(TL_DATUM); tft.setTextPadding(0);
+    tft.setTextFont(4); tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawString("FIRMWARE UPDATE", 10, 20);
+    tft.drawRect(10, 120, 300, 24, TFT_DARKGREY);
+  }
+  lastPct = pct;
+  tft.setTextFont(2); tft.setTextPadding(300);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.drawString(line1, 10, 70);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK); tft.drawString(line2, 10, 90);
+  tft.setTextPadding(0);
+  if (pct >= 0) tft.fillRect(12, 122, 296 * pct / 100, 20, TFT_GREEN);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("Do not unplug the board", 10, 200, 2);
+}
+
+// Browser upload state. Accepts firmware.bin or the merged image from CI:
+// a merged image starts with 0xFF padding and has the app at offset 0x10000.
+struct OtaUpload { size_t seen = 0, skip = 0, total = 0; bool err = false; String msg; } otaUp;
+
+void otaFail(const char* why) {
+  otaUp.err = true; otaUp.msg = why;
+  Update.abort();
+  Serial.printf("OTA failed: %s\n", why);
+}
+
+void handleUpdateChunk() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    otaActive = true;
+    otaUp = OtaUpload();
+    otaUp.total = server.hasHeader("Content-Length") ? server.header("Content-Length").toInt() : 0;
+    Serial.printf("OTA upload: %s\n", up.filename.c_str());
+    drawOtaScreen("Receiving firmware...", up.filename.c_str(), 0);
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) otaFail(Update.errorString());
+  } else if (up.status == UPLOAD_FILE_WRITE && !otaUp.err) {
+    if (otaUp.seen == 0 && up.currentSize > 0 && up.buf[0] == 0xFF) {
+      otaUp.skip = 0x10000;   // merged image: skip bootloader/partition table
+      Serial.println("OTA: merged image, using the app part at 0x10000");
+    }
+    size_t start = 0;
+    if (otaUp.seen < otaUp.skip) start = min((size_t)up.currentSize, otaUp.skip - otaUp.seen);
+    otaUp.seen += up.currentSize;
+    size_t n = up.currentSize - start;
+    if (n > 0 && Update.write(up.buf + start, n) != n) { otaFail(Update.errorString()); return; }
+    char l2[40]; snprintf(l2, sizeof(l2), "%u KB received", (unsigned)(otaUp.seen / 1024));
+    int pct = otaUp.total > 0 ? (int)min((size_t)99, otaUp.seen * 100 / otaUp.total) : 0;
+    drawOtaScreen("Receiving firmware...", l2, pct);
+  } else if (up.status == UPLOAD_FILE_END && !otaUp.err) {
+    if (otaUp.seen <= otaUp.skip) otaFail("file too small");
+    else if (!Update.end(true)) otaFail(Update.errorString());
+    else drawOtaScreen("Update complete", "Restarting...", 100);
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    otaFail("upload aborted");
+  }
+}
+
+void setupArduinoOta() {
+  ArduinoOTA.setHostname(DEVICE_HOSTNAME);
+#ifdef OTA_PASSWORD
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+#endif
+  ArduinoOTA.onStart([]() { otaActive = true; drawOtaScreen("Receiving firmware...", "from PlatformIO", 0); });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    drawOtaScreen("Receiving firmware...", "from PlatformIO", total ? (int)(done * 100ULL / total) : 0);
+  });
+  ArduinoOTA.onEnd([]() { drawOtaScreen("Update complete", "Restarting...", 100); });
+  ArduinoOTA.onError([](ota_error_t e) {
+    char b[32]; snprintf(b, sizeof(b), "Error %u", (unsigned)e);
+    drawOtaScreen("Update failed", b, -1);
+    delay(2000);
+    otaActive = false; lastScreen = 255;
+  });
+  ArduinoOTA.begin();                      // also starts mDNS as <hostname>.local
+  MDNS.addService("http", "tcp", 80);
+  Serial.printf("OTA ready: http://%s.local/ (firmware %s, env %s)\n", DEVICE_HOSTNAME, FW_VERSION, BUILD_ENV);
+}
+
+// ---------------------------------------------------------------------------
 // Web Server — Config Page
 // ---------------------------------------------------------------------------
 void initWebServer() {
@@ -1570,11 +1669,19 @@ void initWebServer() {
   <button type="button" class="opt" style="text-align:center" onclick="post('/led-test','')">Test LED</button>
 </div>
 <div class="card">
+  <h2>Firmware</h2>
+  <div style="font-size:0.9em;color:#aaa">Version <b>)rawliteral" + String(FW_VERSION) + R"rawliteral(</b>, build <b>)rawliteral" + String(BUILD_ENV) + R"rawliteral(</b>. Upload <code>firmware.bin</code> or <code>*-merged.bin</code> from the <b>)rawliteral" + String(BUILD_ENV) + R"rawliteral(</b> build on GitHub.</div>
+  <input type="file" id="fw" accept=".bin" style="margin-top:12px">
+  <progress id="fwp" max="100" value="0" style="width:100%;margin-top:10px;display:none"></progress>
+  <div id="fws" class="hint"></div>
+  <button type="button" onclick="upload()">Update firmware</button>
+</div>
+<div class="card">
   <h2>WiFi</h2>
   <div style="font-size:0.9em;color:#aaa">Connected to <b>)rawliteral" + ssid + R"rawliteral(</b>. Forgetting it restarts the device into setup mode: join the <b>)rawliteral" + String(SETUP_AP_NAME) + R"rawliteral(</b> network from your phone to pick a new one.</div>
   <button type="button" class="danger" onclick="forget()">Forget WiFi &amp; restart</button>
 </div>
-<div class="info">IP: )rawliteral" + WiFi.localIP().toString() + R"rawliteral(</div>
+<div class="info">http://)rawliteral" + String(DEVICE_HOSTNAME) + R"rawliteral(.local &middot; IP )rawliteral" + WiFi.localIP().toString() + R"rawliteral(</div>
 <script>
 function $(i){return document.getElementById(i)}
 function flash(t){var m=$('msg');m.textContent=t;m.style.display='block';setTimeout(function(){m.style.display='none'},3000)}
@@ -1611,6 +1718,20 @@ function saveLed(){
     '&tl='+encodeURIComponent($('tl').value)+'&tw='+encodeURIComponent($('tw').value)+
     '&lr='+encodeURIComponent($('lr').value)+'&lb='+encodeURIComponent($('lb').value);
   post('/led',body,function(x){flash(x.status==200?'✓ LED settings saved!':x.responseText)});
+}
+function upload(){
+  var f=$('fw').files[0];if(!f){flash('Choose a .bin file first');return}
+  if(!confirm('Install '+f.name+'? The device restarts when done.'))return;
+  var fd=new FormData();fd.append('firmware',f,f.name);
+  var x=new XMLHttpRequest(),p=$('fwp'),st=$('fws');
+  p.style.display='block';p.value=0;st.textContent='Uploading...';
+  x.upload.onprogress=function(e){if(e.lengthComputable){p.value=e.loaded*100/e.total;st.textContent='Uploading '+Math.round(e.loaded/1024)+' KB'}};
+  x.onload=function(){
+    if(x.status==200){p.value=100;st.textContent='Done. Restarting, this page reloads in 15 s...';setTimeout(function(){location.reload()},15000)}
+    else{st.textContent='Failed: '+x.responseText}
+  };
+  x.onerror=function(){st.textContent='Upload failed (connection lost)'};
+  x.open('POST','/update',true);x.send(fd);
 }
 function forget(){
   if(!confirm('Forget the saved WiFi network and restart into setup mode?'))return;
@@ -1718,6 +1839,19 @@ function forget(){
     server.send(200, "text/plain", "OK");
   });
 
+  // POST /update — firmware upload from the browser
+  server.on("/update", HTTP_POST, []() {
+    bool ok = !otaUp.err;
+    server.sendHeader("Connection", "close");
+    server.send(ok ? 200 : 500, "text/plain", ok ? "OK" : otaUp.msg);
+    if (ok) { delay(1000); ESP.restart(); }
+    drawOtaScreen("Update failed", otaUp.msg.c_str(), -1);
+    delay(2500);
+    otaActive = false; lastScreen = 255;   // back to normal operation
+  }, handleUpdateChunk);
+  const char* hdrs[] = {"Content-Length"};
+  server.collectHeaders(hdrs, 1);
+
   // POST /wifi-reset — forget saved WiFi and reboot into the setup portal
   server.on("/wifi-reset", HTTP_POST, []() {
     server.send(200, "text/plain", "OK");
@@ -1815,6 +1949,7 @@ void setup() {
   newDataReady = false;
 
   initWebServer();
+  setupArduinoOta();
 
   // Launch background fetcher on Core 0 (Core 1 = Arduino loop)
   xTaskCreatePinnedToCore(
@@ -1836,8 +1971,11 @@ void loop() {
     runWifiPortal(true);
   }
 
-  checkTouch();
   server.handleClient();
+  ArduinoOTA.handle();
+  if (otaActive) { delay(5); return; }   // OTA screen owns the display
+
+  checkTouch();
   render();
   ledUpdate();
   delay(33);

@@ -33,8 +33,11 @@ jobs:
         run: pip install --upgrade platformio
 
       - name: Build ${{ matrix.env }}
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -o pipefail
+          export PLATFORMIO_BUILD_FLAGS="-DFW_VERSION=\\\"${SHA::7}\\\""
           pio run -e ${{ matrix.env }} 2>&1 | tee build.log
 
       # Surface memory usage and our own compiler warnings as annotations

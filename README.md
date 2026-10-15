@@ -10,6 +10,7 @@ A real-time aircraft tracker for the **ESP32 Cheap Yellow Display (CYD)** that r
 - **Weather & System** — live temperature, humidity, and wind from Open-Meteo, plus system stats (uptime, WiFi RSSI, free RAM, API request counters).
 - **Settings screen** — shows the WiFi network, the device's web address and the current location, with on-screen buttons to start WiFi setup or locate the device by its IP address.
 - **WiFi setup portal** — no credentials in code needed: on first boot (or when the saved network is unreachable) the device opens a `PlaneSpotter-Setup` hotspot and shows a QR code: scan it with the phone camera to join, then pick your network and enter your city on the page that opens.
+- **Updates over WiFi** — upload new firmware from the browser (`http://planespotter.local`) or from PlatformIO; no USB cable needed after the first flash.
 - **Web Configuration** — built-in web server with a city search, plus home location, search radius, radar range and a "Forget WiFi" button, from any browser on the same network.
 - **Dual-core architecture** — all HTTP/API calls (aircraft, routes, weather) run on Core 0 in a FreeRTOS task; UI rendering and touch handling run on Core 1, keeping the display smooth.
 - **Back RGB LED alerts** — the LED on the back of the board can glow green/yellow/red by distance to the nearest aircraft, and/or blink when a special aircraft comes within the alert range: helicopters (blue), military (magenta), government/rare aircraft (orange), low-flying aircraft (cyan), or anything on your own watch list of type codes and callsign prefixes (white). Each aircraft blinks once, then the LED glows steadily while it stays in range.
@@ -87,6 +88,13 @@ CYD28/
 ### Flashing a prebuilt image (no PlatformIO)
 
 Every pull request and push to `master` is built by GitHub Actions. Open the run on the **Actions** tab and download the `firmware-<env>` artifact for your board. Flash `<env>-merged.bin` at offset **0x0** with [ESP Tool](https://espressif.github.io/esptool-js/) in Chrome or Edge: *Connect*, pick the board's serial port, set *Flash Address* to `0x0`, choose the file, *Program*. WiFi and location are then set up through the setup portal.
+
+### Updating over WiFi
+
+After the first USB flash, updates don't need a cable:
+
+- **Browser:** open `http://planespotter.local` (or the IP shown on the Settings screen), scroll to **Firmware**, choose `firmware.bin` or `<env>-merged.bin` from the CI build for your board, and press *Update firmware*. The screen shows progress and the device restarts; settings are kept. The page shows the running version (commit hash) and build env.
+- **PlatformIO:** `pio run -e cyd-alt -t upload --upload-port <device IP>` (ArduinoOTA on port 3232). Define `OTA_PASSWORD` in `config.env` to require a password for this route.
 
 ## Usage
 
