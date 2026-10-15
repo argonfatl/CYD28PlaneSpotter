@@ -9,7 +9,7 @@ A real-time aircraft tracker for the **ESP32 Cheap Yellow Display (CYD)** that r
 - **Top 5 In Range** — list of the 5 closest flights with route and altitude info.
 - **Weather & System** — live temperature, humidity, and wind from Open-Meteo, plus system stats (uptime, WiFi RSSI, free RAM, API request counters).
 - **Settings screen** — shows the WiFi network, the device's web address and the current location, with on-screen buttons to start WiFi setup or locate the device by its IP address.
-- **WiFi setup portal** — no credentials in code needed: on first boot (or when the saved network is unreachable) the device opens a `PlaneSpotter-Setup` hotspot where you pick your network and enter your city from a phone.
+- **WiFi setup portal** — no credentials in code needed: on first boot (or when the saved network is unreachable) the device opens a `PlaneSpotter-Setup` hotspot and shows a QR code: scan it with the phone camera to join, then pick your network and enter your city on the page that opens.
 - **Web Configuration** — built-in web server with a city search, plus home location, search radius, radar range and a "Forget WiFi" button, from any browser on the same network.
 - **Dual-core architecture** — all HTTP/API calls (aircraft, routes, weather) run on Core 0 in a FreeRTOS task; UI rendering and touch handling run on Core 1, keeping the display smooth.
 - **Back RGB LED alerts** — the LED on the back of the board can glow green/yellow/red by distance to the nearest aircraft, and/or blink when a special aircraft comes within the alert range: helicopters (blue), military (magenta), government/rare aircraft (orange), low-flying aircraft (cyan), or anything on your own watch list of type codes and callsign prefixes (white). Each aircraft blinks once, then the LED glows steadily while it stays in range.
@@ -77,7 +77,7 @@ CYD28/
    pio run -e cyd -t upload        # single micro-USB
    pio run -e cyd2usb -t upload    # micro-USB + USB-C
    ```
-5. **WiFi setup** (if no credentials in `config.env`): the screen shows instructions. On your phone, join the `PlaneSpotter-Setup` network; the setup page opens by itself (or browse to `http://192.168.4.1`). Tap *Configure WiFi*, choose your network, enter the password and optionally your city (or `lat,lon`), and save. If nothing happens for 5 minutes the device restarts and tries again.
+5. **WiFi setup** (if no credentials in `config.env`): the screen shows instructions and a QR code. Scan it with your phone camera to join the `PlaneSpotter-Setup` network (or join it manually); the setup page opens by itself (or browse to `http://192.168.4.1`). Tap *Configure WiFi*, choose your network, enter the password and optionally your city (or `lat,lon`), and save. If nothing happens for 5 minutes the device restarts and tries again.
 6. Once connected, the web address is shown on the Settings screen; open it in a browser to change settings live.
 
 ## Usage
@@ -97,6 +97,7 @@ Aircraft on the ground are hidden, so taxiing traffic at a nearby airport doesn'
 - [ArduinoJson](https://arduinojson.org/) — JSON parsing
 - [XPT2046_Touchscreen](https://github.com/PaulStoffregen/XPT2046_Touchscreen) — Touch controller
 - [WiFiManager](https://github.com/tzapu/WiFiManager) — WiFi setup portal
+- [QR Code generator](https://github.com/nayuki/QR-Code-generator) by Project Nayuki (MIT) — vendored in `lib/cydqr` with renamed symbols
 
 All managed automatically via PlatformIO `lib_deps`.
 

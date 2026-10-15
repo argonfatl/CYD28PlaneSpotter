@@ -18,6 +18,7 @@
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <WiFiManager.h>
+#include <cydqr.h>
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
@@ -1224,23 +1225,75 @@ void ledUpdate() {
 // ---------------------------------------------------------------------------
 // WiFi setup portal (WiFiManager)
 // ---------------------------------------------------------------------------
+// Draw a QR code as black modules on a white square with a 2-module quiet zone,
+// as large as fits in maxPx, with its right edge at rightX.
+// Returns the size drawn in pixels (0 on failure).
+int drawQrCode(const char* text, int rightX, int y, int maxPx) {
+  const int MAXVER = 6;   // up to ~100 characters at ECC level M
+  uint8_t qr[cydqr_BUFFER_LEN_FOR_VERSION(MAXVER)];
+  uint8_t tmp[cydqr_BUFFER_LEN_FOR_VERSION(MAXVER)];
+  if (!cydqr_encodeText(text, tmp, qr, cydqr_Ecc_MEDIUM, cydqr_VERSION_MIN, MAXVER,
+                        cydqr_Mask_AUTO, true)) return 0;
+
+  const int border = 2;
+  int n = cydqr_getSize(qr);
+  int scale = maxPx / (n + 2 * border);
+  if (scale < 1) return 0;
+  int px = (n + 2 * border) * scale;
+  int x = rightX - px;
+
+  tft.fillRect(x, y, px, px, TFT_WHITE);
+  for (int my = 0; my < n; my++)
+    for (int mx = 0; mx < n; mx++)
+      if (cydqr_getModule(qr, mx, my))
+        tft.fillRect(x + (mx + border) * scale, y + (my + border) * scale, scale, scale, TFT_BLACK);
+  return px;
+}
+
+// WiFi QR payload: WIFI:T:nopass;S:<ssid>;;  with \ ; , : " escaped in the SSID
+String wifiQrPayload(const char* ssid) {
+  String s = "WIFI:T:nopass;S:";
+  for (const char* p = ssid; *p; p++) {
+    if (strchr("\\;,:\"", *p)) s += '\\';
+    s += *p;
+  }
+  return s + ";;";
+}
+
 void drawPortalScreen(WiFiManager*) {
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
   tft.setTextPadding(0);
   tft.setTextFont(4); tft.setTextColor(TFT_GREEN, TFT_BLACK);
   tft.drawString("WIFI SETUP", 10, 8);
-  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("1. On your phone, join the WiFi network:", 10, 44);
-  tft.setTextFont(4); tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString(SETUP_AP_NAME, 22, 66);
-  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("2. The setup page opens by itself", 10, 102);
-  tft.drawString("   (or browse to http://192.168.4.1)", 10, 120);
-  tft.drawString("3. Tap Configure WiFi, pick your network,", 10, 144);
-  tft.drawString("   enter the password and your city", 10, 162);
+
+  // Instructions on the left (each line <= 120 px in font 2, so they clear the QR)
+  tft.setTextFont(2);
+  int y = 42;
+  auto step = [&](const char* num) {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK); tft.drawString(num, 6, y);
+  };
+  auto line = [&](const char* s, uint16_t color) {
+    tft.setTextColor(color, TFT_BLACK); tft.drawString(s, 22, y); y += 17;
+  };
+  step("1."); line("Scan with your", TFT_WHITE);
+  line("phone camera to", TFT_WHITE);
+  line("join the network", TFT_WHITE);
+  line(SETUP_AP_NAME, TFT_YELLOW);
+  y += 6;
+  step("2."); line("Setup page opens", TFT_WHITE);
+  line("(or 192.168.4.1)", TFT_LIGHTGREY);
+  y += 6;
+  step("3."); line("Choose network,", TFT_WHITE);
+  line("enter password", TFT_WHITE);
+  line("and your city", TFT_WHITE);
+
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.drawString("Closes after 5 minutes without changes", 10, 200);
+  tft.drawString("Closes after 5 min", 6, 222);
+
+  // QR on the right: the phone camera offers to join the setup network,
+  // then the setup page opens by itself (captive portal)
+  drawQrCode(wifiQrPayload(SETUP_AP_NAME).c_str(), 314, 40, 176);
 }
 
 // onDemand = started from the settings screen (otherwise: boot without working WiFi)
