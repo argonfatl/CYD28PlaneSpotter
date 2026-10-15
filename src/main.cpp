@@ -17,6 +17,7 @@
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
+#include <WiFiManager.h>
 #include <math.h>
 #include <time.h>
 #include <sys/time.h>
@@ -25,11 +26,26 @@
 #include <freertos/semphr.h>
 
 // =======================================================================
-// CONFIGURATION — loaded from config.env
+// CONFIGURATION — loaded from config.env (optional: WiFi and location can
+// also be set up on the device through the setup portal)
 // =======================================================================
+#if __has_include("config.env")
 #include "config.env"
+#endif
 
 // Defaults for anything config.env doesn't define (keeps older configs building)
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS ""
+#endif
+#ifndef SETUP_AP_NAME
+#define SETUP_AP_NAME "PlaneSpotter-Setup"
+#endif
+#ifndef DEFAULT_HOME_NAME
+#define DEFAULT_HOME_NAME "Lombard, Illinois"
+#endif
 #ifndef UNITS_IMPERIAL
 #define UNITS_IMPERIAL 1
 #endif
@@ -78,8 +94,14 @@ double homeLat = DEFAULT_HOME_LAT;
 double homeLon = DEFAULT_HOME_LON;
 float  searchRadiusNm = DEFAULT_SEARCH_RADIUS_NM;  // API query radius, nautical miles
 float  radarRange = DEFAULT_RADAR_RANGE;           // radar scope radius, display units
+char   homeName[48] = DEFAULT_HOME_NAME;           // shown on the settings screen
 
-SemaphoreHandle_t configMutex = NULL;  // protects homeLat/Lon/searchRadiusNm/radarRange
+SemaphoreHandle_t configMutex = NULL;  // protects homeLat/Lon/Name/searchRadiusNm/radarRange + prefs writes
+
+// Requests handed from the UI (Core 1) to the fetch task (Core 0)
+volatile bool refreshRequested = false;   // skip the rest of the poll wait
+volatile bool ipLocateRequested = false;  // "Locate by IP" button
+char statusMsg[48] = "";                  // one-line feedback on the settings screen
 WebServer server(80);
 Preferences prefs;
 // =======================================================================
@@ -147,7 +169,10 @@ uint8_t screen = 0;
 uint8_t lastScreen = 255;
 uint32_t lastScreenSwap = 0;
 uint32_t lastTouchMs = 0;
-const uint8_t NUM_SCREENS = 4;
+uint32_t wifiConfirmUntil = 0;   // "WiFi setup" needs a second tap within 3 s
+volatile bool portalRequested = false;
+const uint8_t NUM_SCREENS = 5;
+const uint8_t SCREEN_SETTINGS = 4;
 const uint32_t SCREEN_SWAP_MS = 10000;
 
 // ---------------------------------------------------------------------------
@@ -197,22 +222,12 @@ double toDisplayDist(double km) { return km / KM_PER_UNIT; }
 // ---------------------------------------------------------------------------
 // Network & APIs
 // ---------------------------------------------------------------------------
-void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextFont(4);
-  tft.drawString("Connecting WiFi...", 20, 100);
-  while (WiFi.status() != WL_CONNECTED) { delay(400); }
-  tft.fillScreen(TFT_BLACK);
-  lastScreen = 255;  // force full redraw of the current page
-}
-
 // GET a URL and stream-parse the JSON body (no full-payload String in RAM).
 // Returns the HTTP status code, or a negative value on connection/parse failure.
 int httpGetJson(const String& url, JsonDocument& doc, JsonDocument* filter) {
-  WiFiClientSecure client; client.setInsecure();
+  WiFiClientSecure secureClient; secureClient.setInsecure();
+  WiFiClient plainClient;
+  WiFiClient& client = url.startsWith("https://") ? (WiFiClient&)secureClient : plainClient;
   HTTPClient https;
   https.setReuse(false);
   https.useHTTP10(true);   // no chunked encoding -> getStream() is plain JSON
@@ -232,6 +247,101 @@ int httpGetJson(const String& url, JsonDocument& doc, JsonDocument* filter) {
     return -2;
   }
   return code;
+}
+
+// ---------------------------------------------------------------------------
+// Location: set / geocode / locate by IP
+// ---------------------------------------------------------------------------
+String urlEncode(const String& s) {
+  String out;
+  const char* hex = "0123456789ABCDEF";
+  for (unsigned i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
+    else if (c == ' ') out += "%20";
+    else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
+  }
+  return out;
+}
+
+void setStatus(const char* msg) {
+  strncpy(statusMsg, msg, sizeof(statusMsg) - 1);
+  statusMsg[sizeof(statusMsg) - 1] = '\0';
+}
+
+// Apply and persist a new home location, then trigger an immediate refresh
+void setLocation(double lat, double lon, const char* name) {
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  homeLat = lat; homeLon = lon;
+  copyAscii(homeName, (name && name[0]) ? name : "Custom location", sizeof(homeName));
+  prefs.putDouble("lat", lat);
+  prefs.putDouble("lon", lon);
+  prefs.putString("name", homeName);
+  if (configMutex) xSemaphoreGive(configMutex);
+  Serial.printf("Location set: %s (%.4f, %.4f)\n", homeName, lat, lon);
+  refreshRequested = true;
+}
+
+struct GeoResult { char name[48]; double lat; double lon; };
+
+// City search via the Open-Meteo geocoding API. Returns the number of results.
+int geocodeCity(const String& query, GeoResult* out, int maxResults) {
+  String url = "https://geocoding-api.open-meteo.com/v1/search?count=" + String(maxResults) +
+               "&language=en&format=json&name=" + urlEncode(query);
+  JsonDocument filter;
+  filter["results"][0]["name"] = true;
+  filter["results"][0]["admin1"] = true;
+  filter["results"][0]["country_code"] = true;
+  filter["results"][0]["latitude"] = true;
+  filter["results"][0]["longitude"] = true;
+
+  JsonDocument doc;
+  if (httpGetJson(url, doc, &filter) != HTTP_CODE_OK) return -1;
+
+  int n = 0;
+  for (JsonObject r : doc["results"].as<JsonArray>()) {
+    if (n >= maxResults) break;
+    char buf[96];
+    const char* admin = r["admin1"] | "";
+    snprintf(buf, sizeof(buf), admin[0] ? "%s, %s, %s" : "%s, %s",
+             (const char*)(r["name"] | "?"),
+             admin[0] ? admin : (const char*)(r["country_code"] | ""),
+             (const char*)(r["country_code"] | ""));
+    copyAscii(out[n].name, buf, sizeof(out[n].name));
+    out[n].lat = r["latitude"] | 0.0;
+    out[n].lon = r["longitude"] | 0.0;
+    n++;
+  }
+  return n;
+}
+
+// Approximate location from the public IP (ip-api.com, free, HTTP only)
+bool locateByIp() {
+  JsonDocument doc;
+  int code = httpGetJson("http://ip-api.com/json/?fields=status,city,regionName,lat,lon", doc, nullptr);
+  if (code != HTTP_CODE_OK || strcmp(doc["status"] | "", "success") != 0) return false;
+  char name[64];
+  snprintf(name, sizeof(name), "%s, %s", (const char*)(doc["city"] | "?"),
+           (const char*)(doc["regionName"] | ""));
+  setLocation(doc["lat"] | 0.0, doc["lon"] | 0.0, name);
+  return true;
+}
+
+// Text typed in the setup portal: either "lat, lon" or a city name
+bool applyLocationInput(const char* input) {
+  String s = String(input); s.trim();
+  if (s.isEmpty()) return false;
+
+  double lat, lon;
+  if (sscanf(s.c_str(), "%lf , %lf", &lat, &lon) == 2 &&
+      lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+    setLocation(lat, lon, "Custom location");
+    return true;
+  }
+  GeoResult r[1];
+  if (geocodeCity(s, r, 1) == 1) { setLocation(r[0].lat, r[0].lon, r[0].name); return true; }
+  Serial.printf("Could not find location '%s'\n", s.c_str());
+  return false;
 }
 
 // Fills a.dep / a.arr / a.airline from adsbdb (cached). Returns true if a route is known.
@@ -436,7 +546,17 @@ void dataFetcherTask(void* param) {
   bool weatherDone = false;
 
   for (;;) {
+    refreshRequested = false;
     if (WiFi.status() == WL_CONNECTED) {
+      // "Locate by IP" from the settings screen
+      if (ipLocateRequested) {
+        ipLocateRequested = false;
+        setStatus("Locating...");
+        if (locateByIp()) { setStatus("Location updated"); weatherDone = false; }
+        else setStatus("IP lookup failed");
+        refreshRequested = false;
+      }
+
       // Weather (every WEATHER_INTERVAL_MS) — previously blocked the UI loop
       if (!weatherDone || millis() - lastWeatherMs >= WEATHER_INTERVAL_MS) {
         Weather w;
@@ -469,9 +589,13 @@ void dataFetcherTask(void* param) {
       }
     }
 
-    // Wait for the next poll interval (1 s chunks keep the task responsive)
-    for (int t = 0; t < UPDATE_INTERVAL_MS / 1000; t++) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
+    // Wait for the next poll interval; a location change or button press cuts it short
+    for (int t = 0; t < UPDATE_INTERVAL_MS / 250; t++) {
+      if (refreshRequested || ipLocateRequested) {
+        if (refreshRequested) weatherDone = false;  // new location -> new weather too
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(250));
     }
   }
 }
@@ -787,6 +911,67 @@ void screenWeatherSystem(bool newPage) {
   tft.setTextPadding(0);
 }
 
+// Settings screen: WiFi / location info + two touch buttons
+const int SET_BTN_Y = 185, SET_BTN_H = 40;
+const int SET_BTN_WIFI_X = 10, SET_BTN_LOC_X = 165, SET_BTN_W = 145;
+
+void screenSettings(bool newPage) {
+  drawHeader("SETTINGS", newPage);
+
+  double hLat, hLon; float sRad; char name[48];
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  hLat = homeLat; hLon = homeLon; sRad = searchRadiusNm;
+  strcpy(name, homeName);
+  if (configMutex) xSemaphoreGive(configMutex);
+
+  char buf[64];
+  tft.setTextFont(2);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextPadding(300);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(buf, sizeof(buf), "WiFi: %s (%d dBm)", WiFi.SSID().c_str(), WiFi.RSSI());
+    tft.drawString(buf, 10, 34);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    snprintf(buf, sizeof(buf), "Web settings: http://%s", WiFi.localIP().toString().c_str());
+    tft.drawString(buf, 10, 54);
+  } else {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("WiFi: not connected", 10, 34);
+    tft.drawString(" ", 10, 54);
+  }
+
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.drawString("Location:", 10, 80);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString(name, 10, 98);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  snprintf(buf, sizeof(buf), "%.4f, %.4f   search %d NM", hLat, hLon, (int)sRad);
+  tft.drawString(buf, 10, 116);
+
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString(statusMsg[0] ? statusMsg : " ", 10, 150);
+  tft.setTextPadding(0);
+
+  // Buttons: redraw only when their state changes (avoids flicker)
+  static int lastWifiBtn = -1;
+  int wifiBtn = millis() < wifiConfirmUntil ? 1 : 0;
+  if (newPage || wifiBtn != lastWifiBtn) {
+    lastWifiBtn = wifiBtn;
+    tft.setTextDatum(MC_DATUM);
+    tft.fillRoundRect(SET_BTN_WIFI_X, SET_BTN_Y, SET_BTN_W, SET_BTN_H, 6, wifiBtn ? TFT_ORANGE : TFT_DARKGREY);
+    tft.setTextColor(TFT_WHITE, wifiBtn ? TFT_ORANGE : TFT_DARKGREY);
+    tft.drawString(wifiBtn ? "TAP AGAIN" : "WIFI SETUP", SET_BTN_WIFI_X + SET_BTN_W / 2, SET_BTN_Y + SET_BTN_H / 2);
+    if (newPage) {
+      tft.fillRoundRect(SET_BTN_LOC_X, SET_BTN_Y, SET_BTN_W, SET_BTN_H, 6, TFT_DARKGREY);
+      tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+      tft.drawString("LOCATE BY IP", SET_BTN_LOC_X + SET_BTN_W / 2, SET_BTN_Y + SET_BTN_H / 2);
+    }
+    tft.setTextDatum(TL_DATUM);
+  }
+}
+
 void render() {
   bool newPage = false;
   if (screen != lastScreen) {
@@ -802,16 +987,102 @@ void render() {
     case 1: screenTop5(newPage);        break;
     case 2: screenRadar(newPage);       break;
     case 3: screenWeatherSystem(newPage); break;
+    case 4: screenSettings(newPage);    break;
   }
   if (dataMutex) xSemaphoreGive(dataMutex);
 }
 
+// ---------------------------------------------------------------------------
+// WiFi setup portal (WiFiManager)
+// ---------------------------------------------------------------------------
+void drawPortalScreen(WiFiManager*) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextPadding(0);
+  tft.setTextFont(4); tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString("WIFI SETUP", 10, 8);
+  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("1. On your phone, join the WiFi network:", 10, 44);
+  tft.setTextFont(4); tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString(SETUP_AP_NAME, 22, 66);
+  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("2. The setup page opens by itself", 10, 102);
+  tft.drawString("   (or browse to http://192.168.4.1)", 10, 120);
+  tft.drawString("3. Tap Configure WiFi, pick your network,", 10, 144);
+  tft.drawString("   enter the password and your city", 10, 162);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("Closes after 5 minutes without changes", 10, 200);
+}
+
+// onDemand = started from the settings screen (otherwise: boot without working WiFi)
+bool runWifiPortal(bool onDemand) {
+  WiFiManager wm;
+  WiFiManagerParameter locParam("location", "Your city, or lat,lon (optional)", "", 63);
+  wm.addParameter(&locParam);
+  wm.setTitle("CYD Plane Spotter");
+  wm.setConfigPortalTimeout(300);
+  wm.setConnectTimeout(20);
+  wm.setAPCallback(drawPortalScreen);
+
+  bool ok;
+  if (onDemand) {
+    server.stop();                 // the portal needs port 80
+    drawPortalScreen(nullptr);
+    ok = wm.startConfigPortal(SETUP_AP_NAME);
+  } else {
+    ok = wm.autoConnect(SETUP_AP_NAME);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {   // portal timed out: go back to saved network
+    WiFi.mode(WIFI_STA);
+    WiFi.begin();
+  }
+  if (ok && WiFi.status() == WL_CONNECTED) {
+    if (applyLocationInput(locParam.getValue())) setStatus("Location updated");
+    else setStatus("WiFi saved");
+  }
+  if (onDemand) server.begin();
+
+  tft.fillScreen(TFT_BLACK);
+  lastScreen = 255;   // full redraw of the current page
+  return ok;
+}
+
+void connectWiFiAtBoot() {
+  WiFi.mode(WIFI_STA);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextFont(4);
+  tft.drawString("Connecting WiFi...", 20, 100);
+
+  // Credentials from config.env, if any, are tried first
+  if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "yourWifiId") != 0) {
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; i++) delay(500);
+  }
+  // Otherwise saved credentials, and if those fail, the setup portal
+  if (WiFi.status() != WL_CONNECTED && !runWifiPortal(false)) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("Setup timed out", 20, 90);
+    tft.drawString("Restarting...", 20, 120);
+    delay(3000);
+    ESP.restart();
+  }
+  WiFi.setAutoReconnect(true);
+  tft.fillScreen(TFT_BLACK);
+  lastScreen = 255;
+}
+
+// ---------------------------------------------------------------------------
+// Touch
+// ---------------------------------------------------------------------------
 void changeRange(float delta) {
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
   radarRange = constrain(radarRange + delta, RANGE_MIN, RANGE_MAX);
   float r = radarRange;
-  if (configMutex) xSemaphoreGive(configMutex);
   prefs.putFloat("range_u", r);
+  if (configMutex) xSemaphoreGive(configMutex);
   Serial.printf("Radar range: %d %s\n", (int)r, DIST_UNIT);
 }
 
@@ -851,8 +1122,22 @@ void checkTouch() {
           }
         }
 
+        // Settings screen buttons (bottom row)
+        if (screen == SCREEN_SETTINGS && sy >= SET_BTN_Y - 10) {
+          if (sx < 160) {
+            // WiFi setup interrupts tracking, so it needs a confirming second tap
+            if (millis() < wifiConfirmUntil) { wifiConfirmUntil = 0; portalRequested = true; }
+            else wifiConfirmUntil = millis() + 3000;
+          } else {
+            if (WiFi.status() == WL_CONNECTED) { setStatus("Locating..."); ipLocateRequested = true; }
+            else setStatus("No WiFi connection");
+          }
+          return;
+        }
+
         // Default: cycle to next screen
         screen = (screen + 1) % NUM_SCREENS;
+        wifiConfirmUntil = 0;
         lastScreenSwap = millis();
       }
     }
@@ -865,10 +1150,13 @@ void checkTouch() {
 void initWebServer() {
   // GET / — serve config page
   server.on("/", []() {
-    double hLat, hLon; float sRad, rRange;
+    double hLat, hLon; float sRad, rRange; String name;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-    hLat = homeLat; hLon = homeLon; sRad = searchRadiusNm; rRange = radarRange;
+    hLat = homeLat; hLon = homeLon; sRad = searchRadiusNm; rRange = radarRange; name = homeName;
     if (configMutex) xSemaphoreGive(configMutex);
+    name.replace("&", "&amp;"); name.replace("\"", "&quot;"); name.replace("<", "&lt;");
+    String ssid = WiFi.SSID();
+    ssid.replace("&", "&amp;"); ssid.replace("<", "&lt;");
 
     String html = R"rawliteral(
 <!DOCTYPE html><html><head>
@@ -877,18 +1165,31 @@ void initWebServer() {
 <style>
   body{font-family:Arial,sans-serif;background:#0a0a1a;color:#e0e0e0;margin:0;padding:20px}
   h1{color:#00ff88;text-align:center;font-size:1.4em}
+  h2{color:#00ff88;font-size:1em;margin:0 0 8px}
   .card{background:#1a1a2e;border-radius:12px;padding:20px;margin:12px 0;max-width:420px;margin-left:auto;margin-right:auto}
   label{display:block;margin:10px 0 4px;color:#aaa;font-size:0.85em}
   input{width:100%;padding:10px;border:1px solid #333;border-radius:6px;background:#0d0d1f;color:#fff;font-size:1em;box-sizing:border-box}
   input:focus{border-color:#00ff88;outline:none}
   button{width:100%;padding:12px;margin-top:16px;background:#00ff88;color:#000;border:none;border-radius:8px;font-size:1.1em;font-weight:bold;cursor:pointer}
   button:hover{background:#00cc6a}
+  .row{display:flex;gap:8px}.row input{flex:1}.row button{width:auto;margin-top:0;padding:10px 16px}
+  .opt{background:#0d0d1f;color:#e0e0e0;border:1px solid #333;font-weight:normal;font-size:0.95em;margin-top:6px;text-align:left}
+  .opt:hover{background:#22223a}
+  .danger{background:#3a1a1a;color:#ff8080}.danger:hover{background:#552222}
   .info{text-align:center;color:#666;font-size:0.8em;margin-top:12px}
-  .saved{color:#00ff88;text-align:center;display:none;margin-top:8px}
+  .msg{color:#00ff88;text-align:center;display:none;margin-top:8px}
+  #res{font-size:0.9em;color:#aaa;margin-top:6px}
 </style></head><body>
 <h1>&#9992; CYD Plane Spotter</h1>
 <div class="card">
+  <h2>Find location</h2>
+  <div class="row"><input id="q" placeholder="City, e.g. Lombard"><button type="button" onclick="find()">Search</button></div>
+  <div id="res"></div>
+</div>
+<div class="card">
   <form id="cfg" onsubmit="save(event)">
+    <label>Location name</label>
+    <input name="name" id="name" maxlength="47" value=")rawliteral" + name + R"rawliteral(">
     <label>Home Latitude (&deg;)</label>
     <input type="number" step="any" name="lat" id="lat" value=")rawliteral" + String(hLat, 6) + R"rawliteral(" required>
     <label>Home Longitude (&deg;)</label>
@@ -899,29 +1200,64 @@ void initWebServer() {
     <input type="number" step="1" name="range" id="range" value=")rawliteral" + String((int)rRange) + R"rawliteral(" required>
     <button type="submit">Save Settings</button>
   </form>
-  <div class="saved" id="msg">&#10003; Settings saved!</div>
+  <div class="msg" id="msg"></div>
+</div>
+<div class="card">
+  <h2>WiFi</h2>
+  <div style="font-size:0.9em;color:#aaa">Connected to <b>)rawliteral" + ssid + R"rawliteral(</b>. Forgetting it restarts the device into setup mode: join the <b>)rawliteral" + String(SETUP_AP_NAME) + R"rawliteral(</b> network from your phone to pick a new one.</div>
+  <button type="button" class="danger" onclick="forget()">Forget WiFi &amp; restart</button>
 </div>
 <div class="info">IP: )rawliteral" + WiFi.localIP().toString() + R"rawliteral(</div>
 <script>
+function $(i){return document.getElementById(i)}
+function flash(t){var m=$('msg');m.textContent=t;m.style.display='block';setTimeout(function(){m.style.display='none'},3000)}
+function find(){
+  var q=$('q').value.trim(),r=$('res');if(q.length<2)return;
+  r.textContent='Searching...';
+  fetch('/geocode?q='+encodeURIComponent(q)).then(function(x){if(!x.ok)throw 0;return x.json()}).then(function(a){
+    r.innerHTML='';
+    if(!a.length){r.textContent='Nothing found';return}
+    a.forEach(function(p){
+      var b=document.createElement('button');b.type='button';b.className='opt';b.textContent=p.n;
+      b.onclick=function(){$('lat').value=p.lat;$('lon').value=p.lon;$('name').value=p.n;r.textContent='Selected - press Save Settings';};
+      r.appendChild(b);
+    });
+  }).catch(function(){r.textContent='Search failed'});
+}
+$('q').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();find()}});
 function save(e){
   e.preventDefault();
   var x=new XMLHttpRequest();
   x.open('POST','/save',true);
   x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
-  x.onload=function(){
-    var m=document.getElementById('msg');
-    m.textContent=x.status==200?'✓ Settings saved!':x.responseText;
-    m.style.display='block';
-    setTimeout(function(){m.style.display='none'},3000);
-  };
-  x.send('lat='+encodeURIComponent(document.getElementById('lat').value)+
-         '&lon='+encodeURIComponent(document.getElementById('lon').value)+
-         '&radius='+encodeURIComponent(document.getElementById('radius').value)+
-         '&range='+encodeURIComponent(document.getElementById('range').value));
+  x.onload=function(){flash(x.status==200?'✓ Settings saved!':x.responseText)};
+  x.send(['name','lat','lon','radius','range'].map(function(k){return k+'='+encodeURIComponent($(k).value)}).join('&'));
+}
+function forget(){
+  if(!confirm('Forget the saved WiFi network and restart into setup mode?'))return;
+  var x=new XMLHttpRequest();x.open('POST','/wifi-reset',true);x.send();
+  flash('Restarting into setup mode...');
 }
 </script></body></html>)rawliteral";
 
     server.send(200, "text/html", html);
+  });
+
+  // GET /geocode?q=city — proxy to the Open-Meteo geocoding API
+  server.on("/geocode", []() {
+    String q = server.arg("q"); q.trim();
+    if (q.length() < 2) { server.send(400, "text/plain", "Query too short"); return; }
+    GeoResult r[5];
+    int n = geocodeCity(q, r, 5);
+    if (n < 0) { server.send(502, "text/plain", "Geocoding failed"); return; }
+    JsonDocument d;
+    JsonArray a = d.to<JsonArray>();
+    for (int i = 0; i < n; i++) {
+      JsonObject o = a.add<JsonObject>();
+      o["n"] = r[i].name; o["lat"] = r[i].lat; o["lon"] = r[i].lon;
+    }
+    String out; serializeJson(d, out);
+    server.send(200, "application/json", out);
   });
 
   // POST /save — persist new config
@@ -935,6 +1271,7 @@ function save(e){
     double newLon = server.arg("lon").toDouble();
     float  newRad = server.arg("radius").toFloat();
     float  newRng = server.arg("range").toFloat();
+    String newName = server.arg("name"); newName.trim();
 
     if (newLat < -90 || newLat > 90 || newLon < -180 || newLon > 180 ||
         newRad < 1 || newRad > MAX_SEARCH_NM || newRng < RANGE_MIN || newRng > RANGE_MAX) {
@@ -943,20 +1280,24 @@ function save(e){
     }
 
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-    homeLat = newLat;
-    homeLon = newLon;
     searchRadiusNm = newRad;
     radarRange = newRng;
-    if (configMutex) xSemaphoreGive(configMutex);
-
-    prefs.putDouble("lat", newLat);
-    prefs.putDouble("lon", newLon);
     prefs.putFloat("radius_nm", newRad);
     prefs.putFloat("range_u", newRng);
+    if (configMutex) xSemaphoreGive(configMutex);
+    setLocation(newLat, newLon, newName.c_str());
 
-    Serial.printf("Config saved: lat=%.6f lon=%.6f radius=%.0f nm range=%.0f %s\n",
-                  newLat, newLon, newRad, newRng, DIST_UNIT);
+    Serial.printf("Config saved: radius=%.0f nm range=%.0f %s\n", newRad, newRng, DIST_UNIT);
     server.send(200, "text/plain", "OK");
+  });
+
+  // POST /wifi-reset — forget saved WiFi and reboot into the setup portal
+  server.on("/wifi-reset", HTTP_POST, []() {
+    server.send(200, "text/plain", "OK");
+    delay(500);
+    WiFiManager wm;
+    wm.resetSettings();
+    ESP.restart();
   });
 
   server.begin();
@@ -968,6 +1309,10 @@ function save(e){
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+
+  // Mutexes first: setLocation() may run during WiFi setup
+  dataMutex = xSemaphoreCreateMutex();
+  configMutex = xSemaphoreCreateMutex();
 
   touchSpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, -1);
   ts.begin(touchSpi);
@@ -987,26 +1332,23 @@ void setup() {
 
   for (int i = 0; i < ROUTE_CACHE_SIZE; i++) routeCache[i].valid = false;
 
-  connectWiFi();
+  // Load persisted config (or use defaults) before WiFi setup, which may change the location.
+  // New keys: older firmware stored the radius in degrees and the range in km.
+  prefs.begin("cyd-spotter", false);
+  homeLat = prefs.getDouble("lat", homeLat);
+  homeLon = prefs.getDouble("lon", homeLon);
+  copyAscii(homeName, prefs.getString("name", homeName).c_str(), sizeof(homeName));
+  searchRadiusNm = constrain(prefs.getFloat("radius_nm", searchRadiusNm), 1.0f, MAX_SEARCH_NM);
+  radarRange = constrain(prefs.getFloat("range_u", radarRange), RANGE_MIN, RANGE_MAX);
+  Serial.printf("Config loaded: %s lat=%.6f lon=%.6f radius=%.0f nm range=%.0f %s\n",
+                homeName, homeLat, homeLon, searchRadiusNm, radarRange, DIST_UNIT);
+
+  connectWiFiAtBoot();
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   setenv("TZ", TIMEZONE, 1); tzset();
 
   nearest.valid = false;
   newDataReady = false;
-
-  // Load persisted config (or use defaults).
-  // New keys: older firmware stored the radius in degrees and the range in km.
-  prefs.begin("cyd-spotter", false);
-  homeLat = prefs.getDouble("lat", homeLat);
-  homeLon = prefs.getDouble("lon", homeLon);
-  searchRadiusNm = constrain(prefs.getFloat("radius_nm", searchRadiusNm), 1.0f, MAX_SEARCH_NM);
-  radarRange = constrain(prefs.getFloat("range_u", radarRange), RANGE_MIN, RANGE_MAX);
-  Serial.printf("Config loaded: lat=%.6f lon=%.6f radius=%.0f nm range=%.0f %s\n",
-                homeLat, homeLon, searchRadiusNm, radarRange, DIST_UNIT);
-
-  // Create mutexes before the task (task uses them)
-  dataMutex = xSemaphoreCreateMutex();
-  configMutex = xSemaphoreCreateMutex();
 
   initWebServer();
 
@@ -1023,8 +1365,12 @@ void setup() {
 }
 
 void loop() {
-  // WiFi health — reconnect if needed (draws to TFT so must be Core 1)
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  // WiFi drops are handled by the ESP32 auto-reconnect; the fetch task
+  // simply skips polls while offline and the settings screen shows the state.
+  if (portalRequested) {
+    portalRequested = false;
+    runWifiPortal(true);
+  }
 
   checkTouch();
   server.handleClient();
