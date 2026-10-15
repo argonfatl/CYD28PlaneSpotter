@@ -249,6 +249,11 @@ const uint8_t NUM_SCREENS = 4;              // screens cycled by tapping
 const uint8_t SCREEN_SETTINGS = 4;          // settings menu, opened with the gear icon
 uint8_t screenBeforeSettings = 0;
 
+// Optional on-screen arrows: a tap shows them, they hide after 15 s without touches
+bool navButtons = false;
+uint32_t navShownUntil = 0;
+const uint32_t NAV_TIMEOUT_MS = 15000;
+
 // Touch calibration: screen = affine(raw). Default matches a typical CYD panel.
 float touchCal[6] = {0.0f, -0.086486f, 337.30f,    // sx = a*rx + b*ry + c
                      -0.064865f, 0.0f, 252.97f};   // sy = d*rx + e*ry + f
@@ -1382,12 +1387,14 @@ void screenWeatherSystem(bool newPage) {
 
 // Settings menu: status lines + 2x3 grid of big buttons
 struct MenuBtn { int x, y, w, h; };
-const MenuBtn MENU_BTNS[6] = {
-  {6, 98, 150, 42},  {164, 98, 150, 42},
-  {6, 146, 150, 42}, {164, 146, 150, 42},
-  {6, 194, 150, 42}, {164, 194, 150, 42},
+const int MENU_N = 7;
+const MenuBtn MENU_BTNS[MENU_N] = {
+  {6, 97, 150, 32},  {164, 97, 150, 32},
+  {6, 132, 150, 32}, {164, 132, 150, 32},
+  {6, 167, 150, 32}, {164, 167, 150, 32},
+  {6, 202, 308, 32},
 };
-enum { MB_WIFI, MB_LOCATE, MB_CALIBRATE, MB_BRIGHT, MB_LED, MB_BACK };
+enum { MB_WIFI, MB_LOCATE, MB_CALIBRATE, MB_BRIGHT, MB_LED, MB_NAV, MB_BACK };
 
 void drawMenuButton(int i, const char* label, uint16_t bg) {
   const MenuBtn& b = MENU_BTNS[i];
@@ -1399,9 +1406,9 @@ void drawMenuButton(int i, const char* label, uint16_t bg) {
 }
 
 int menuButtonAt(int sx, int sy) {
-  for (int i = 0; i < 6; i++) {
+  for (int i = 0; i < MENU_N; i++) {
     const MenuBtn& b = MENU_BTNS[i];
-    if (sx >= b.x - 3 && sx < b.x + b.w + 3 && sy >= b.y - 3 && sy < b.y + b.h + 3) return i;
+    if (sx >= b.x - 3 && sx < b.x + b.w + 3 && sy >= b.y - 2 && sy < b.y + b.h + 2) return i;
   }
   return -1;
 }
@@ -1450,7 +1457,7 @@ void screenSettings(bool newPage) {
   // Buttons: redraw only when a label or state changes (no flicker)
   static uint32_t lastKey = 0xFFFFFFFF;
   bool wifiArmed = millis() < wifiConfirmUntil;
-  uint32_t key = (wifiArmed ? 1 : 0) | (ledAlerts ? 2 : 0) | ((uint32_t)backlightPct << 8);
+  uint32_t key = (wifiArmed ? 1 : 0) | (ledAlerts ? 2 : 0) | (navButtons ? 4 : 0) | ((uint32_t)backlightPct << 8);
   if (newPage || key != lastKey) {
     lastKey = key;
     drawMenuButton(MB_WIFI, wifiArmed ? "TAP AGAIN" : "WIFI SETUP", wifiArmed ? TFT_ORANGE : C_BLUEB);
@@ -1459,6 +1466,7 @@ void screenSettings(bool newPage) {
     snprintf(buf, sizeof(buf), "BRIGHTNESS %u%%", backlightPct);
     drawMenuButton(MB_BRIGHT, buf, C_BLUEB);
     drawMenuButton(MB_LED, ledAlerts ? "LED ALERTS ON" : "LED ALERTS OFF", ledAlerts ? 0x0400 : C_BADGE);
+    drawMenuButton(MB_NAV, navButtons ? "NAV BUTTONS ON" : "NAV BUTTONS OFF", navButtons ? 0x0400 : C_BADGE);
     drawMenuButton(MB_BACK, "< BACK", C_BADGE);
   }
 }
@@ -1897,10 +1905,35 @@ void handleMenuButton(int b) {
       prefs.putBool("led_alert", ledCfg.alerts);
       if (configMutex) xSemaphoreGive(configMutex);
       break;
+    case MB_NAV:
+      navButtons = !navButtons;
+      prefs.putBool("navbtn", navButtons);
+      break;
     case MB_BACK:
       screen = screenBeforeSettings;
       break;
   }
+}
+
+// ---- On-screen navigation arrows ----
+const int NAV_Y = 95, NAV_H = 50, NAV_W = 36;
+bool navVisible() { return navButtons && screen != SCREEN_SETTINGS && millis() < navShownUntil; }
+
+void drawNavArrow(int x, bool right) {
+  tft.fillRoundRect(x, NAV_Y, NAV_W, NAV_H, 8, C_BLUEB);
+  tft.drawRoundRect(x, NAV_Y, NAV_W, NAV_H, 8, TFT_LIGHTGREY);
+  int cx = x + NAV_W / 2, cy = NAV_Y + NAV_H / 2;
+  if (right) tft.fillTriangle(cx - 6, cy - 11, cx - 6, cy + 11, cx + 8, cy, TFT_WHITE);
+  else       tft.fillTriangle(cx + 6, cy - 11, cx + 6, cy + 11, cx - 8, cy, TFT_WHITE);
+}
+
+// Drawn after each frame while visible; when they time out, the page is redrawn clean
+void updateNavOverlay() {
+  static bool wasVisible = false;
+  bool vis = navVisible();
+  if (vis) { drawNavArrow(2, false); drawNavArrow(320 - NAV_W - 2, true); }
+  else if (wasVisible) lastScreen = 255;
+  wasVisible = vis;
 }
 
 // Acts once per press (on touch-down), using the calibrated mapping
@@ -1934,6 +1967,17 @@ void checkTouch() {
   if (screen == 2 && sy >= BTN_Y - 10) {
     if (sx >= BTN_MINUS_X - 8 && sx < BTN_MINUS_X + BTN_W + 5) { changeRange(-RANGE_STEP); return; }
     if (sx >= BTN_PLUS_X - 5 && sx <= BTN_PLUS_X + BTN_W + 8) { changeRange(+RANGE_STEP); return; }
+  }
+
+  // Navigation arrows mode: a tap shows the arrows; only the arrows switch pages
+  if (navButtons) {
+    bool shown = navVisible();
+    navShownUntil = millis() + NAV_TIMEOUT_MS;
+    if (shown && sy >= NAV_Y - 15 && sy < NAV_Y + NAV_H + 15) {
+      if (sx < NAV_W + 20)        { screen = (screen + NUM_SCREENS - 1) % NUM_SCREENS; return; }
+      if (sx >= 320 - NAV_W - 20) { screen = (screen + 1) % NUM_SCREENS; return; }
+    }
+    return;
   }
 
   // Anywhere else: next screen
@@ -2394,6 +2438,7 @@ void setup() {
   PREF("led_bright", getUChar, ledCfg.brightness);
   if (prefs.isKey("led_watch")) copyAscii(ledCfg.watch, prefs.getString("led_watch").c_str(), sizeof(ledCfg.watch));
   PREF("bl", getUChar, backlightPct);
+  PREF("navbtn", getBool, navButtons);
   #undef PREF
   ledInit();
 
@@ -2447,6 +2492,7 @@ void loop() {
 
   checkTouch();
   render();
+  updateNavOverlay();
   ledUpdate();
   delay(33);
 }
