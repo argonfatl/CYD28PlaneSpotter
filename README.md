@@ -80,6 +80,10 @@ CYD28/
 5. **WiFi setup** (if no credentials in `config.env`): the screen shows instructions and a QR code. Scan it with your phone camera to join the `PlaneSpotter-Setup` network (or join it manually); the setup page opens by itself (or browse to `http://192.168.4.1`). Tap *Configure WiFi*, choose your network, enter the password and optionally your city (or `lat,lon`), and save. If nothing happens for 5 minutes the device restarts and tries again.
 6. Once connected, the web address is shown on the Settings screen; open it in a browser to change settings live.
 
+### Flashing a prebuilt image (no PlatformIO)
+
+Every pull request and push to `master` is built by GitHub Actions. Open the run on the **Actions** tab and download `firmware-cyd` or `firmware-cyd2usb`. Flash `<env>-merged.bin` at offset **0x0** with [ESP Tool](https://espressif.github.io/esptool-js/) in Chrome or Edge: *Connect*, pick the board's serial port, set *Flash Address* to `0x0`, choose the file, *Program*. WiFi and location are then set up through the setup portal.
+
 ## Usage
 
 - **Tap the screen** to cycle through the 5 screens.
