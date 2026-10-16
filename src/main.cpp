@@ -1760,7 +1760,7 @@ void screenWeatherSystem(bool newPage) {
     label("LOCAL WEATHER", 12, 35);
     tft.drawFastVLine(178, 38, 74, C_EDGE);
     tft.setTextFont(2); tft.setTextColor(C_SOFT, C_PANEL);
-    tft.drawString("Wind", 186, 40); tft.drawString("Humidity", 186, 64); tft.drawString("Pressure", 186, 88);
+    tft.drawString("Wind", 186, 40); tft.drawString("Humidity", 186, 64); tft.drawString("Baro", 186, 88);
     tft.drawFastHLine(186, 59, 122, C_EDGE); tft.drawFastHLine(186, 83, 122, C_EDGE);
 
     card(4, 123, 154, 48); card(162, 123, 154, 48);
@@ -1864,9 +1864,9 @@ void screenWeatherSystem(bool newPage) {
   tft.fillRect(248, 198, 64, 30, C_PANEL);
   tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
   if (!lastOkMs) snprintf(buf, sizeof(buf), "--");
-  else if (ago < 120) snprintf(buf, sizeof(buf), "%lus ago", (unsigned long)ago);
-  else if (ago < 7200) snprintf(buf, sizeof(buf), "%lum ago", (unsigned long)(ago / 60));
-  else snprintf(buf, sizeof(buf), "%luh ago", (unsigned long)(ago / 3600));
+  else if (ago < 120) snprintf(buf, sizeof(buf), "%lus", (unsigned long)ago);
+  else if (ago < 7200) snprintf(buf, sizeof(buf), "%lum", (unsigned long)(ago / 60));
+  else snprintf(buf, sizeof(buf), "%luh", (unsigned long)(ago / 3600));
   tft.drawString(fitPx(buf, 64), 248, 203);
   tft.setTextFont(2);
 }
