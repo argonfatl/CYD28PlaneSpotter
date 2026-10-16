@@ -333,8 +333,20 @@ int httpGetJson(const String& url, JsonDocument& doc, JsonDocument* filter,
   int code = https.GET();
   if (code != HTTP_CODE_OK) {
     if (code < 0) {
-      Serial.printf("HTTP error %d (%s): %s\n", code, https.errorToString(code).c_str(), url.c_str());
-      if (err) snprintf(err, errLen, "%s", https.errorToString(code).c_str());
+      // HTTPClient reports every connect failure as "connection refused"; for HTTPS
+      // the real reason (DNS, TCP, TLS handshake, out of memory) is in the TLS client
+      char tls[64] = "";
+      if (url.startsWith("https://")) {
+        int e = secureClient.lastError(tls, sizeof(tls));
+        if (e == 0) tls[0] = '\0';
+      }
+      Serial.printf("HTTP error %d (%s) [%s] heap %u max block %u: %s\n", code,
+                    https.errorToString(code).c_str(), tls, (unsigned)ESP.getFreeHeap(),
+                    (unsigned)ESP.getMaxAllocHeap(), url.c_str());
+      if (err) {
+        if (tls[0]) snprintf(err, errLen, "TLS: %s", tls);
+        else snprintf(err, errLen, "%s", https.errorToString(code).c_str());
+      }
     } else {
       Serial.printf("HTTP %d: %s\n", code, url.c_str());
       if (err) snprintf(err, errLen, "HTTP %d", code);
@@ -624,7 +636,8 @@ const Source SOURCES[] = {
 };
 const int NUM_SOURCES = sizeof(SOURCES) / sizeof(SOURCES[0]);
 volatile int activeSource = 0;      // index of the last source that worked
-char lastFetchErr[48] = "";         // last aircraft fetch error, for the status screen
+char lastFetchErr[96] = "";         // last aircraft fetch error, for the status screen
+uint32_t lastOkMs = 0;              // when aircraft data last arrived
 
 String sourceUrl(int i, double lat, double lon, int radiusNm) {
   char buf[128];
@@ -696,12 +709,12 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   for (int k = 0; k < NUM_SOURCES && !ok; k++) {
     int i = (start + k) % NUM_SOURCES;
     String url = sourceUrl(i, hLat, hLon, (int)ceilf(sRadNm));
-    char err[40] = "";
+    char err[72] = "";
     doc.clear();
     if (httpGetJson(url, doc, &filter, err, sizeof(err)) == HTTP_CODE_OK) {
       ok = true;
       activeSource = i;
-      lastFetchErr[0] = '\0';
+      lastOkMs = millis();
     } else {
       snprintf(lastFetchErr, sizeof(lastFetchErr), "%s: %s", SOURCES[i].name, err);
       Serial.printf("Aircraft source %s failed: %s\n", SOURCES[i].name, err);
@@ -1362,7 +1375,9 @@ void screenWeatherSystem(bool newPage) {
   snprintf(bufSys, sizeof(bufSys), "WiFi RSSI: %d dBm", WiFi.RSSI());
   tft.drawString(bufSys, 180, 130);
 
-  snprintf(bufSys, sizeof(bufSys), "RAM Free: %d KB", ESP.getFreeHeap() / 1024);
+  // Free heap and the largest free block (a TLS connection needs a large one)
+  snprintf(bufSys, sizeof(bufSys), "RAM %uK  blk %uK", (unsigned)(ESP.getFreeHeap() / 1024),
+           (unsigned)(ESP.getMaxAllocHeap() / 1024));
   tft.drawString(bufSys, 20, 160);
 
   snprintf(bufSys, sizeof(bufSys), "Max seen: %u", stats.maxInView);
@@ -1373,14 +1388,24 @@ void screenWeatherSystem(bool newPage) {
            (unsigned long)stats.requestsOk, (unsigned long)stats.requestsFail);
   tft.drawString(bufSys, 20, 190);
 
-  if (lastFetchErr[0]) {
-    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-    snprintf(bufSys, sizeof(bufSys), "Err %s", lastFetchErr);
+  // Where and when aircraft data last arrived
+  if (lastOkMs) {
+    uint32_t ago = (millis() - lastOkMs) / 1000;
+    tft.setTextColor(ago < 60 ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
+    if (ago < 120) snprintf(bufSys, sizeof(bufSys), "Data: %s, %lus ago", SOURCES[activeSource].name, (unsigned long)ago);
+    else snprintf(bufSys, sizeof(bufSys), "Data: %s, %lum ago", SOURCES[activeSource].name, (unsigned long)(ago / 60));
   } else {
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    snprintf(bufSys, sizeof(bufSys), "Source: %s", SOURCES[activeSource].name);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    snprintf(bufSys, sizeof(bufSys), "Data: none yet");
   }
-  tft.drawString(bufSys, 20, 212);
+  tft.drawString(bufSys, 20, 210);
+
+  // Last error (small font so the whole reason fits)
+  tft.setTextFont(1);
+  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+  char errLine[100];
+  snprintf(errLine, sizeof(errLine), "%s", lastFetchErr[0] ? lastFetchErr : " ");
+  tft.drawString(errLine, 20, 229);
 
   tft.setTextPadding(0);
 }
@@ -2399,7 +2424,7 @@ void setup() {
   const uint16_t testColors[] = {TFT_RED, TFT_GREEN, TFT_BLUE};
   for (uint16_t c : testColors) { tft.fillScreen(c); delay(150); }
 
-  radarSpr.setColorDepth(16);
+  radarSpr.setColorDepth(8);   // 40 KB instead of 80 KB: leaves room for TLS connections
   radarSpr.createSprite(200, 200);
 
   TJpgDec.setSwapBytes(true);
