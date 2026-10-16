@@ -22,6 +22,7 @@
 #include <Update.h>
 #include <HTTPUpdate.h>
 #include <esp_ota_ops.h>
+#include <LittleFS.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <cydqr.h>
@@ -159,13 +160,13 @@ struct LedConfig {                 // protected by configMutex, persisted in NVS
 } ledCfg;
 
 // Phone notifications through ntfy (https://ntfy.sh): protected by configMutex, persisted in NVS
-enum { NT_WATCH = 1, NT_MIL = 2, NT_INTR = 4, NT_HELI = 8, NT_LOW = 16 };
+enum { NT_WATCH = 1, NT_MIL = 2, NT_INTR = 4, NT_HELI = 8, NT_LOW = 16, NT_EMERG = 32, NT_NEWTYPE = 64 };
 struct NotifyConfig {
   bool on = false;
   char server[64] = "https://ntfy.sh";
   char topic[65] = "";
   float range = 5;                 // display units
-  uint8_t cats = NT_WATCH | NT_MIL | NT_INTR | NT_HELI;
+  uint8_t cats = NT_WATCH | NT_MIL | NT_INTR | NT_HELI | NT_EMERG | NT_NEWTYPE;
   int lowAltFt = 1000;             // for NT_LOW
   uint8_t coolH = 6;               // the same aircraft again only after this many hours
   bool quietNight = true;          // nothing while night mode is active
@@ -173,7 +174,7 @@ struct NotifyConfig {
 volatile bool notifyTestRequested = false;
 char notifyStatus[64] = "";        // last result, for the web page
 
-enum AlertKind : uint8_t { ALERT_NONE, ALERT_LOWALT, ALERT_HELI, ALERT_INTERESTING, ALERT_MILITARY, ALERT_WATCH };
+enum AlertKind : uint8_t { ALERT_NONE, ALERT_LOWALT, ALERT_HELI, ALERT_INTERESTING, ALERT_MILITARY, ALERT_WATCH, ALERT_EMERG };
 struct AlertInfo {
   AlertKind kind = ALERT_NONE;
   char callsign[10] = ""; char type[6] = "";
@@ -186,6 +187,7 @@ volatile bool ledTestRequested = false;
 
 const char* alertName(AlertKind k) {
   switch (k) {
+    case ALERT_EMERG: return "EMERGENCY";
     case ALERT_WATCH: return "WATCH";
     case ALERT_MILITARY: return "MIL";
     case ALERT_INTERESTING: return "SPECIAL";
@@ -226,6 +228,7 @@ struct Aircraft {
   char model[32];                       // e.g. "Boeing 737-7V3" (nearest aircraft only)
 };
 Aircraft nearest;
+Aircraft selAc;                     // the tapped aircraft (any on the radar), under dataMutex
 
 
 // Top 5 Tracker
@@ -234,7 +237,45 @@ Aircraft top5[MAX_TOP5];
 uint8_t top5Count = 0;
 
 // Blips for Radar (the MAX_BLIPS nearest aircraft)
-struct Blip { double lat; double lon; float track; float speedKt; char callsign[10]; int altFt; double distKm; };
+struct Blip { double lat; double lon; float track; float speedKt; char callsign[10]; int altFt; double distKm; char hex[8]; };
+
+// Emergency squawk (7500 / 7600 / 7700 or a readsb emergency state) anywhere in the search area
+struct Emergency {
+  bool on = false;
+  char cs[10] = "", hex[8] = "", type[6] = "", squawk[5] = "", what[16] = "";
+  double km = 0, brg = 0; int alt = 0;
+};
+Emergency emergency;                // published under dataMutex
+bool emergencyBanner = true;        // red banner on the screen (NVS "emg_on")
+
+// Selected aircraft (tap a traffic row or a radar blip): followed by ICAO address
+char selectedHex[8] = "";
+uint32_t selectedUntil = 0;
+const uint32_t SELECT_MS = 120000;
+volatile bool selectRequested = false;   // poll now to fill in the details
+
+// Radar trails: last positions of the aircraft on the radar
+const int TRAIL_PTS = 8;
+struct Trail { char hex[8]; uint8_t n; float lat[TRAIL_PTS], lon[TRAIL_PTS]; uint32_t seenMs; };
+Trail trails[24];                   // under dataMutex
+
+// Extra screens and page rotation (web page "Screens" card)
+enum { SHOW_OFF, SHOW_PAGE, SHOW_IDLE };
+struct ScreensConfig {
+  bool rotate = false; uint16_t rotateSec = 15;
+  uint8_t clockShow = SHOW_IDLE, clockStyle = 0; bool clock24 = false;
+  uint8_t metarShow = SHOW_OFF; char metarIcao[5] = "";
+  float idleRange = 10;             // "no aircraft nearby" = none within this (display units)
+} scr;
+volatile bool metarRequested = false;
+
+struct Metar {
+  bool valid = false;
+  char id[5] = "", name[40] = "", cat[5] = "", visib[8] = "", ceiling[16] = "";
+  uint32_t obs = 0; float temp = 0, dewp = 0, altim = 0; int wdir = 0, wspd = 0, wgst = 0;
+  char raw[168] = "";
+} metar;                            // under dataMutex
+char metarErr[48] = "";
 const uint8_t MAX_BLIPS = 20;
 Blip blips[MAX_BLIPS];
 uint8_t blipCount = 0;
@@ -273,8 +314,9 @@ uint32_t wifiConfirmUntil = 0;   // "WiFi setup" needs a second tap within 3 s
 uint32_t updConfirmUntil = 0;    // "Update" (install) needs a second tap within 3 s
 volatile bool portalRequested = false;
 volatile bool calibrateRequested = false;   // from the settings menu or the web page
-const uint8_t NUM_SCREENS = 4;              // screens cycled by tapping
-const uint8_t SCREEN_SETTINGS = 4;          // settings menu, opened with the gear icon
+enum { S_NEAREST, S_TRAFFIC, S_RADAR, S_WEATHER, S_CLOCK, S_METAR };
+const uint8_t NUM_SCREENS = 6;              // pages; clock and METAR only when enabled
+const uint8_t SCREEN_SETTINGS = 6;          // settings menu, opened from the clock / WiFi icon
 uint8_t screenBeforeSettings = 0;
 
 // Optional on-screen arrows: a tap shows them, they hide after 15 s without touches
@@ -673,7 +715,7 @@ struct LogRecord { char cs[10] = ""; char type[6] = ""; int alt = 0; float kt = 
 struct LogNotable { uint32_t hex; char cs[10]; char type[6]; AlertKind kind; time_t first; double km; int alt; };
 struct DayLog {
   int yday = -1; time_t since = 0;
-  uint8_t seenBits[8192];           // 65536-bit Bloom filter of ICAO addresses (under 1% error)
+  uint8_t seenBits[4096];           // 32768-bit Bloom filter of ICAO addresses (a few % low at 3000/day)
   uint32_t total = 0;
   uint16_t hours[24];
   LogRecord lowest, fastest, closest;
@@ -698,7 +740,7 @@ bool logBegin() {
 }
 
 bool logSeenNew(uint32_t h) {
-  uint16_t a = (uint16_t)((h * 2654435761u) >> 16), b = (uint16_t)(((h ^ 0x5bd1e995u) * 0x9E3779B1u) >> 16);
+  uint16_t a = (uint16_t)((h * 2654435761u) >> 17), b = (uint16_t)(((h ^ 0x5bd1e995u) * 0x9E3779B1u) >> 17);
   bool seen = (dayLog.seenBits[a >> 3] & (1 << (a & 7))) && (dayLog.seenBits[b >> 3] & (1 << (b & 7)));
   dayLog.seenBits[a >> 3] |= 1 << (a & 7); dayLog.seenBits[b >> 3] |= 1 << (b & 7);
   return !seen;
@@ -711,7 +753,7 @@ void logRecord(LogRecord& r, const char* cs, const char* type, int alt, float kt
 
 // One aircraft from the current poll (call with logMutex held)
 void logAircraft(const char* hexStr, const char* cs, const char* type, const char* category,
-                 uint8_t dbFlags, int alt, float kt, double km, const WatchList& wl) {
+                 uint8_t dbFlags, int alt, float kt, double km, const WatchList& wl, bool emerg) {
   if (!hexStr[0]) return;
   uint32_t hex = strtoul(hexStr[0] == '~' ? hexStr + 1 : hexStr, nullptr, 16) | (hexStr[0] == '~' ? 0x1000000u : 0);
   time_t now = time(nullptr);
@@ -726,7 +768,7 @@ void logAircraft(const char* hexStr, const char* cs, const char* type, const cha
 
   // Notable: watch list, military, government/rare, helicopters (regardless of LED settings)
   LedConfig all; all.military = all.interesting = all.heli = true; all.lowAltFt = 0;
-  AlertKind k = classifyAlert(all, wl, cs, type, category, dbFlags, alt);
+  AlertKind k = emerg ? ALERT_EMERG : classifyAlert(all, wl, cs, type, category, dbFlags, alt);
   if (k == ALERT_NONE) return;
   for (int i = 0; i < dayLog.nNotable; i++) {
     LogNotable& n = dayLog.notable[i];
@@ -765,10 +807,66 @@ void notifyConsider(const NotifyConfig& nc, const WatchList& wl, const WatchList
   n.kind = k; n.km = km; n.brg = brg; n.alt = alt; n.kt = kt;
 }
 
+// ---------------------------------------------------------------------------
+// Type collection: every ICAO aircraft type seen, kept in LittleFS (/types.csv).
+// RAM holds only the packed type codes (4 bytes each) for the "is it new?" check.
+// ---------------------------------------------------------------------------
+const int COL_MAX = 700;
+uint32_t colTypes[COL_MAX]; int colCount = 0;   // sorted; fetch task only (after setup)
+bool fsOk = false;
+volatile bool collectionResetRequested = false;
+uint32_t colStart = 0;                          // when the collection started (NVS "col_start")
+struct NewType { char type[6], hex[8], cs[10], reg[10]; };
+NewType newTypes[4]; int newTypeN = 0;          // found during a poll, saved after it
+char newTypeBanner[48] = ""; uint32_t newTypeBannerUntil = 0;
+
+uint32_t packType(const char* t) {
+  uint32_t v = 0;
+  for (int i = 0; i < 4 && t[i]; i++) v |= (uint32_t)(uint8_t)t[i] << (24 - 8 * i);
+  return v;
+}
+
+// Inserts into the sorted list; false if it was already there (or the list is full)
+bool colInsert(uint32_t v) {
+  int lo = 0, hi = colCount;
+  while (lo < hi) { int m = (lo + hi) / 2; if (colTypes[m] < v) lo = m + 1; else hi = m; }
+  if (lo < colCount && colTypes[lo] == v) return false;
+  if (colCount >= COL_MAX) return false;
+  memmove(colTypes + lo + 1, colTypes + lo, (colCount - lo) * sizeof(uint32_t));
+  colTypes[lo] = v; colCount++;
+  return true;
+}
+
+void collectionLoad() {
+  colCount = 0;
+  File f = LittleFS.open("/types.csv", "r");
+  if (!f) return;
+  char line[160];
+  while (f.available()) {
+    int n = f.readBytesUntil('\n', line, sizeof(line) - 1); line[n] = '\0';
+    char* c = strchr(line, ','); if (!c) continue;
+    *c = '\0';
+    colInsert(packType(line));
+  }
+  f.close();
+  Serial.printf("Type collection: %d types\n", colCount);
+}
+
+// Called while parsing a poll
+void collectionConsider(const char* type, const char* hex, const char* cs, const char* reg) {
+  if (!fsOk || strlen(type) < 2 || time(nullptr) < 1700000000) return;
+  if (newTypeN >= 4) return;                    // the rest waits for the next poll
+  uint32_t v = packType(type);
+  if (!colInsert(v)) return;
+  NewType& n = newTypes[newTypeN++];
+  copyAscii(n.type, type, sizeof(n.type)); copyAscii(n.hex, hex, sizeof(n.hex));
+  copyAscii(n.cs, cs, sizeof(n.cs)); copyAscii(n.reg, reg, sizeof(n.reg));
+}
+
 // Fetches aircraft data into caller-provided local buffers (thread-safe — no globals touched)
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                      Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut,
-                     AlertInfo& alertOut) {
+                     AlertInfo& alertOut, Emergency& emOut, Aircraft& selOut) {
   // Snapshot config under mutex (Core 0 reads, Core 1 may write via web UI)
   double hLat, hLon; float sRadNm; LedConfig lc;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
@@ -778,6 +876,12 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   WatchList wl; wl.parse(lc.watch);
   double alertKm = lc.alertRange * KM_PER_UNIT;
   alertOut = AlertInfo();
+  emOut = Emergency();
+  selOut.valid = false;
+  char selHex[8];
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+  strcpy(selHex, (selectedUntil && (int32_t)(selectedUntil - millis()) > 0) ? selectedHex : "");
+  if (dataMutex) xSemaphoreGive(dataMutex);
 
   // Keep only the fields we use — near a big airport the raw payload is large.
   // The sources use the same readsb format; the array is "ac" (some use "aircraft").
@@ -785,7 +889,7 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   for (const char* key : {"ac", "aircraft"}) {
     JsonObject f = filter[key].add<JsonObject>();
     for (const char* fld : {"hex", "flight", "r", "t", "lat", "lon", "alt_baro", "alt_geom", "gs",
-                            "track", "baro_rate", "geom_rate", "category", "dbFlags"})
+                            "track", "baro_rate", "geom_rate", "category", "dbFlags", "squawk", "emergency"})
       f[fld] = true;
   }
 
@@ -844,7 +948,29 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     copyAscii(category, s["category"] | "", sizeof(category));
     uint8_t dbFlags = s["dbFlags"] | 0;
     count++;
-    if (logging) logAircraft(s["hex"] | "", cs, type, category, dbFlags, altFt, gsKt, d, wl);
+
+    // Emergency: squawk 7500/7600/7700 or a readsb emergency state
+    const char* sq = s["squawk"] | "";
+    const char* em = s["emergency"] | "none";
+    const char* what = nullptr;
+    if (!strcmp(sq, "7700")) what = "EMERGENCY";
+    else if (!strcmp(sq, "7600")) what = "RADIO FAILURE";
+    else if (!strcmp(sq, "7500")) what = "HIJACK";
+    else if (!strcmp(em, "general")) what = "EMERGENCY";
+    else if (!strcmp(em, "lifeguard")) what = "MEDICAL";
+    else if (!strcmp(em, "minfuel")) what = "MIN FUEL";
+    else if (!strcmp(em, "nordo")) what = "RADIO FAILURE";
+    else if (!strcmp(em, "unlawful")) what = "HIJACK";
+    else if (!strcmp(em, "downed")) what = "DOWNED";
+    if (what && (!emOut.on || d < emOut.km)) {
+      emOut.on = true; emOut.km = d; emOut.brg = brg; emOut.alt = altFt;
+      copyAscii(emOut.cs, cs[0] ? cs : "?", sizeof(emOut.cs)); copyAscii(emOut.hex, s["hex"] | "", sizeof(emOut.hex));
+      copyAscii(emOut.type, type, sizeof(emOut.type)); copyAscii(emOut.squawk, sq, sizeof(emOut.squawk));
+      copyAscii(emOut.what, what, sizeof(emOut.what));
+    }
+
+    if (logging) logAircraft(s["hex"] | "", cs, type, category, dbFlags, altFt, gsKt, d, wl, what != nullptr);
+    collectionConsider(type, s["hex"] | "", cs, s["r"] | "");
     if (nc.on && nc.topic[0])
       notifyConsider(nc, wl, noWatch, s["hex"] | "", cs, type, s["r"] | "", category, dbFlags, altFt, gsKt, d, brg);
 
@@ -872,6 +998,7 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
       b.lat = lat; b.lon = lon; b.track = track; b.speedKt = gsKt;
       b.altFt = altFt; b.distKm = d;
       strcpy(b.callsign, cs);
+      copyAscii(b.hex, s["hex"] | "", sizeof(b.hex));
     }
 
     Aircraft a;
@@ -888,6 +1015,7 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     strcpy(a.category, category);
     a.dbFlags = dbFlags;
     copyAscii(a.reg, s["r"] | "", sizeof(a.reg));
+    if (selHex[0] && strcmp(a.hex, selHex) == 0) selOut = a;   // the tapped aircraft, wherever it is
 
     int insertIdx = -1;
     for (int i = 0; i < MAX_TOP5; i++) {
@@ -1004,6 +1132,66 @@ void runGithubUpdate() {
 String withCommas(int v);
 bool nightNow();
 
+// METAR from aviationweather.gov: the configured station, or the nearest one to home
+bool fetchMetarTo(Metar& m, char* err, size_t errLen) {
+  char icao[5]; double hLat, hLon;
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  strcpy(icao, scr.metarIcao); hLat = homeLat; hLon = homeLon;
+  if (configMutex) xSemaphoreGive(configMutex);
+
+  JsonDocument filter;
+  for (const char* f : {"icaoId", "name", "obsTime", "temp", "dewp", "wdir", "wspd", "wgst", "visib",
+                        "altim", "rawOb", "fltCat", "lat", "lon"})
+    filter[0][f] = true;
+  filter[0]["clouds"][0]["cover"] = true; filter[0]["clouds"][0]["base"] = true;
+
+  JsonDocument d;
+  for (double box : {0.5, 1.5}) {
+    char url[160];
+    if (icao[0]) snprintf(url, sizeof(url), "https://aviationweather.gov/api/data/metar?ids=%s&format=json", icao);
+    else snprintf(url, sizeof(url), "https://aviationweather.gov/api/data/metar?bbox=%.2f,%.2f,%.2f,%.2f&format=json",
+                  hLat - box, hLon - box, hLat + box, hLon + box);
+    int code = httpGetJson(url, d, &filter, err, errLen);
+    if (code == 204) { d.clear(); if (icao[0]) break; continue; }   // no reports: widen the box
+    if (code != HTTP_CODE_OK) return false;
+    if (d.as<JsonArray>().size() > 0 || icao[0]) break;
+  }
+  JsonArray a = d.as<JsonArray>();
+  if (a.size() == 0) { snprintf(err, errLen, icao[0] ? "no report for %s" : "no station nearby", icao); return false; }
+
+  JsonObject best; double bestKm = 1e9;
+  for (JsonObject o : a) {
+    double k = haversineKm(hLat, hLon, o["lat"] | 0.0, o["lon"] | 0.0);
+    if (k < bestKm) { bestKm = k; best = o; }
+  }
+  m = Metar();
+  copyAscii(m.id, best["icaoId"] | "", sizeof(m.id));
+  copyAscii(m.name, best["name"] | "", sizeof(m.name));
+  copyAscii(m.cat, best["fltCat"] | "", sizeof(m.cat));
+  m.obs = best["obsTime"] | 0;
+  m.temp = best["temp"] | 0.0f; m.dewp = best["dewp"] | 0.0f; m.altim = best["altim"] | 0.0f;
+  m.wdir = best["wdir"].is<int>() ? best["wdir"].as<int>() : -1;     // -1 = variable
+  m.wspd = best["wspd"] | 0; m.wgst = best["wgst"] | 0;
+  if (best["visib"].is<const char*>()) copyAscii(m.visib, best["visib"], sizeof(m.visib));
+  else snprintf(m.visib, sizeof(m.visib), "%g", best["visib"] | 0.0);
+  // Ceiling: lowest broken or overcast layer
+  m.ceiling[0] = '\0';
+  for (JsonObject c : best["clouds"].as<JsonArray>()) {
+    const char* cv = c["cover"] | "";
+    if (!strcmp(cv, "BKN") || !strcmp(cv, "OVC") || !strcmp(cv, "OVX")) {
+      snprintf(m.ceiling, sizeof(m.ceiling), "%s %s", cv, withCommas(c["base"] | 0).c_str());
+      break;
+    }
+  }
+  if (!m.ceiling[0]) snprintf(m.ceiling, sizeof(m.ceiling), "None");
+  copyAscii(m.raw, best["rawOb"] | "", sizeof(m.raw));
+  m.valid = true;
+  return true;
+}
+
+// Saves the types found in the last poll (with the model name from adsbdb) and announces them
+void collectionSaveNew(const struct NotifyConfig& nc);
+
 // POST one message to <server>/<topic>. Returns the HTTP status (200 = sent).
 int ntfySend(const NotifyConfig& nc, const char* title, const String& body, const char* tags,
              const String& click, int priority) {
@@ -1030,7 +1218,7 @@ int ntfySend(const NotifyConfig& nc, const char* title, const String& body, cons
 }
 
 // After each poll: send candidates not notified within the cooldown (at most 3 per poll)
-void processNotifications() {
+void processNotifications(const Emergency& em) {
   NotifyConfig nc;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
   nc = notifyCfg;
@@ -1043,7 +1231,23 @@ void processNotifications() {
                       "airplane,white_check_mark", "", 3) == HTTP_CODE_OK)
       snprintf(notifyStatus, sizeof(notifyStatus), "Test sent");
   }
-  if (!nc.on || !nc.topic[0] || notifyCandN == 0) return;
+  if (!nc.on || !nc.topic[0]) return;
+
+  // Emergencies: any distance, even at night, once an hour per aircraft
+  static char emHex[8] = ""; static uint32_t emMs = 0;
+  if ((nc.cats & NT_EMERG) && em.on && (strcmp(emHex, em.hex) != 0 || millis() - emMs > 3600000UL)) {
+    char title[64], body[128];
+    if (!strcmp(em.squawk, "7500") || !strcmp(em.squawk, "7600") || !strcmp(em.squawk, "7700")) snprintf(title, sizeof(title), "Squawk %s %s: %s", em.squawk, em.what, em.cs);
+    else snprintf(title, sizeof(title), "%s: %s", em.what, em.cs);
+    if (em.type[0]) snprintf(title + strlen(title), sizeof(title) - strlen(title), " (%s)", em.type);
+    snprintf(body, sizeof(body), "%.1f %s %s, %s ft", em.km / KM_PER_UNIT, DIST_UNIT, compass(em.brg), withCommas(em.alt).c_str());
+    if (ntfySend(nc, title, body, "rotating_light,airplane", String("https://globe.airplanes.live/?icao=") + em.hex, 5) == HTTP_CODE_OK) {
+      strcpy(emHex, em.hex); emMs = millis();
+      snprintf(notifyStatus, sizeof(notifyStatus), "Sent emergency %s", em.cs);
+    }
+  }
+
+  if (notifyCandN == 0) return;
   if (nc.quietNight && nightNow()) return;
 
   struct Sent { char hex[8]; uint32_t ms; };
@@ -1059,8 +1263,8 @@ void processNotifications() {
     }
     if (idx >= 0 && now - sent[idx].ms < cool) continue;
 
-    static const char* what[] = {"", "Low flying", "Helicopter", "Rare aircraft", "Military", "Watch list"};
-    static const char* tags[] = {"", "airplane,arrow_down", "helicopter", "airplane,star", "airplane,warning", "airplane,eyes"};
+    static const char* what[] = {"", "Low flying", "Helicopter", "Rare aircraft", "Military", "Watch list", "Emergency"};
+    static const char* tags[] = {"", "airplane,arrow_down", "helicopter", "airplane,star", "airplane,warning", "airplane,eyes", "rotating_light"};
     char title[64];
     if (n.type[0]) snprintf(title, sizeof(title), "%s nearby: %s (%s)", what[n.kind], n.cs, n.type);
     else snprintf(title, sizeof(title), "%s nearby: %s", what[n.kind], n.cs);
@@ -1079,6 +1283,32 @@ void processNotifications() {
   }
 }
 
+void collectionSaveNew(const NotifyConfig& nc) {
+  if (newTypeN && !colStart && time(nullptr) > 1700000000) { colStart = time(nullptr); prefs.putUInt("col_start", colStart); }
+  for (int i = 0; i < newTypeN; i++) {
+    NewType& n = newTypes[i];
+    Aircraft a = {}; copyAscii(a.hex, n.hex, sizeof(a.hex));
+    getAircraftModel(a);                      // "Airbus A320-251N" (cached, may be empty)
+    char model[32]; copyAscii(model, a.model, sizeof(model));
+    for (char* c = model; *c; c++) if (*c == ',') *c = ' ';
+    File f = LittleFS.open("/types.csv", "a");
+    if (f) { f.printf("%s,%lu,%s,%s,%s,%s\n", n.type, (unsigned long)time(nullptr), n.hex, n.cs, n.reg, model); f.close(); }
+    Serial.printf("New type for the collection: %s %s (%s)\n", n.type, model, n.cs);
+    snprintf(newTypeBanner, sizeof(newTypeBanner), "NEW TYPE %s  %s", n.type, model[0] ? model : n.cs);
+    newTypeBannerUntil = millis() + 30000;
+
+    // The first day fills the collection with everything common, so stay quiet then
+    bool learning = !colStart || (uint32_t)time(nullptr) - colStart < 86400;
+    if (nc.on && nc.topic[0] && (nc.cats & NT_NEWTYPE) && !learning && !(nc.quietNight && nightNow())) {
+      char title[64], body[96];
+      snprintf(title, sizeof(title), "New for your collection: %s", n.type);
+      snprintf(body, sizeof(body), "%s%s%s, %d types so far", model[0] ? model : "Unknown model", n.cs[0] ? " - " : "", n.cs, colCount);
+      ntfySend(nc, title, body, "airplane,tada", String("https://globe.airplanes.live/?icao=") + n.hex, 3);
+    }
+  }
+  newTypeN = 0;
+}
+
 // ===================================================================
 // Background Data Fetcher — runs on Core 0 so Core 1 stays smooth
 // ===================================================================
@@ -1090,7 +1320,10 @@ void dataFetcherTask(void* param) {
   uint8_t locBlipCount = 0;
   Aircraft locNearest;
   AlertInfo locAlert;
+  Emergency locEm;
+  Aircraft locSel;
   locNearest.valid = false;
+  uint32_t lastMetarMs = 0; bool metarDone = false;
 
   uint32_t lastWeatherMs = 0;
   bool weatherDone = false;
@@ -1127,11 +1360,33 @@ void dataFetcherTask(void* param) {
         weatherDone = true;
       }
 
-      if (fetchAircraftTo(locTop5, locTop5Count, locNearest, locBlips, locBlipCount, locAlert)) {
+      // METAR (every 10 min while a METAR screen is enabled, or right after a settings change)
+      if (scr.metarShow != SHOW_OFF && (metarRequested || !metarDone || millis() - lastMetarMs >= 600000UL)) {
+        metarRequested = false;
+        Metar m; char err[48] = "";
+        if (fetchMetarTo(m, err, sizeof(err))) {
+          xSemaphoreTake(dataMutex, portMAX_DELAY); metar = m; xSemaphoreGive(dataMutex);
+          metarErr[0] = '\0';
+        } else {
+          snprintf(metarErr, sizeof(metarErr), "%s", err[0] ? err : "request failed");
+        }
+        lastMetarMs = millis(); metarDone = true;
+      }
+
+      if (collectionResetRequested) {
+        collectionResetRequested = false;
+        if (fsOk) LittleFS.remove("/types.csv");
+        colCount = 0; newTypeN = 0; colStart = 0; prefs.remove("col_start");
+        Serial.println("Type collection cleared");
+      }
+
+      selectRequested = false;
+      if (fetchAircraftTo(locTop5, locTop5Count, locNearest, locBlips, locBlipCount, locAlert, locEm, locSel)) {
         // Routes for the top 5 (cached, so usually no network call)
         for (int i = 0; i < locTop5Count; i++)
           locTop5[i].hasRoute = getRoute(locTop5[i]);
         if (locTop5Count > 0) { getAircraftModel(locTop5[0]); locNearest = locTop5[0]; }
+        if (locSel.valid) { locSel.hasRoute = getRoute(locSel); getAircraftModel(locSel); }
 
         // Atomically publish results to the globals used by render()
         xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -1142,20 +1397,43 @@ void dataFetcherTask(void* param) {
         nearest = locNearest;
         currentAlert = locAlert;
         if (locAlert.kind != ALERT_NONE) { lastAlert = locAlert; lastAlertMs = millis(); }
+        emergency = locEm;
+        if (locSel.valid) selAc = locSel;
         lastDataMs = millis();
         stats.lastUpdateMs = lastDataMs;
+        // Trails: add each radar aircraft's position; forget aircraft gone for 2 minutes
+        for (int i = 0; i < locBlipCount; i++) {
+          const Blip& b = locBlips[i];
+          if (!b.hex[0]) continue;
+          int t = -1, freeT = -1;
+          for (int j = 0; j < 24; j++) {
+            if (trails[j].hex[0] && strcmp(trails[j].hex, b.hex) == 0) { t = j; break; }
+            if (freeT < 0 && (!trails[j].hex[0] || millis() - trails[j].seenMs > 120000UL)) freeT = j;
+          }
+          if (t < 0) { if (freeT < 0) continue; t = freeT; strcpy(trails[t].hex, b.hex); trails[t].n = 0; }
+          Trail& tr = trails[t];
+          if (tr.n == TRAIL_PTS) { memmove(tr.lat, tr.lat + 1, sizeof(float) * (TRAIL_PTS - 1)); memmove(tr.lon, tr.lon + 1, sizeof(float) * (TRAIL_PTS - 1)); tr.n--; }
+          tr.lat[tr.n] = b.lat; tr.lon[tr.n] = b.lon; tr.n++;
+          tr.seenMs = millis();
+        }
         xSemaphoreGive(dataMutex);
 
-        processNotifications();
+        processNotifications(locEm);
+        NotifyConfig nc;
+        if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+        nc = notifyCfg;
+        if (configMutex) xSemaphoreGive(configMutex);
+        collectionSaveNew(nc);
       } else if (notifyTestRequested) {
         notifyCandN = 0;
-        processNotifications();
+        processNotifications(Emergency());
       }
     }
 
     // Wait for the next poll interval; a location change or button press cuts it short
     for (int t = 0; t < UPDATE_INTERVAL_MS / 250; t++) {
-      if (refreshRequested || ipLocateRequested || ghCheckRequested || ghUpdateRequested || notifyTestRequested) {
+      if (refreshRequested || ipLocateRequested || ghCheckRequested || ghUpdateRequested || notifyTestRequested ||
+          selectRequested || metarRequested) {
         if (refreshRequested) weatherDone = false;  // new location -> new weather too
         break;
       }
@@ -1245,9 +1523,6 @@ const Theme* th = &THEMES[0];         // active theme
 #define C_DIM8   (th->dim8)      // radar sweep tail
 
 // Currently selected aircraft (tap a row on the traffic page); falls back to nearest
-char selectedCs[10] = "";
-uint32_t selectedUntil = 0;
-const uint32_t SELECT_MS = 120000;
 
 // ---- Small helpers ----
 String fitPx(const char* s, int maxW) {
@@ -1482,12 +1757,16 @@ void drawHeader(const char* title, bool newPage) {
 // Selected aircraft if one was tapped recently and is still in the top 5, else nearest
 const Aircraft* targetAircraft(bool* isSelected = nullptr) {
   if (isSelected) *isSelected = false;
-  if (selectedCs[0] && stillBefore(selectedUntil)) {
+  if (selectedHex[0] && stillBefore(selectedUntil)) {
     for (int i = 0; i < top5Count; i++)
-      if (strcmp(top5[i].callsign, selectedCs) == 0) {
+      if (strcmp(top5[i].hex, selectedHex) == 0) {
         if (isSelected) *isSelected = i != 0;
         return i == 0 ? &nearest : &top5[i];
       }
+    if (selAc.valid && strcmp(selAc.hex, selectedHex) == 0) {   // tapped on the radar, beyond the top 5
+      if (isSelected) *isSelected = true;
+      return &selAc;
+    }
   }
   return nearest.valid ? &nearest : nullptr;
 }
@@ -1670,6 +1949,7 @@ const int RANGE_PRESETS[4] = {200, 100, 50, 25};
 #endif
 const int RB_X = 4, RB_W = 38, RB_Y = 30, RB_H = 46, RB_STEP = 52;
 const int SCOPE_X = 46, SCOPE_Y = 30, SCOPE = 186;   // sprite size (8-bit, ~34 KB)
+int16_t blipSX[MAX_BLIPS], blipSY[MAX_BLIPS]; bool blipVis[MAX_BLIPS];   // last drawn, for taps
 
 void drawRangeButtons(float current) {
   for (int k = 0; k < 4; k++) {
@@ -1764,6 +2044,25 @@ void screenRadar(bool newPage) {
   radarSpr.fillCircle(cx, cy, 2, C_CYAN);
 
   float elapsed = (millis() - lastDataMs) / 1000.0f;
+  auto toScope = [&](double la, double lo, int& x, int& y) {
+    float fr = (float)(haversineKm(hLat, hLon, la, lo) / rMaxKm);
+    if (fr > 1) return false;
+    double b = deg2rad(bearingDeg(hLat, hLon, la, lo));
+    x = cx + (int)(sin(b) * fr * R); y = cy - (int)(cos(b) * fr * R);
+    return true;
+  };
+  // Trails: earlier positions, older ones dimmer
+  for (uint8_t i = 0; i < blipCount; i++) {
+    for (const Trail& tr : trails) {
+      if (!tr.hex[0] || strcmp(tr.hex, blips[i].hex) != 0) continue;
+      for (int k = 0; k + 1 < tr.n; k++) {
+        int x, y;
+        if (toScope(tr.lat[k], tr.lon[k], x, y)) radarSpr.fillRect(x, y, 2, 2, k < tr.n / 2 ? C_DIM8 : C_RING8);
+      }
+      break;
+    }
+  }
+  for (uint8_t i = 0; i < blipCount; i++) blipVis[i] = false;
   for (uint8_t i = 0; i < blipCount; i++) {
     double la = blips[i].lat, lo = blips[i].lon;
     if (blips[i].speedKt > 0 && elapsed > 0)
@@ -1775,7 +2074,8 @@ void screenRadar(bool newPage) {
     double brg = bearingDeg(hLat, hLon, la, lo);
     int bx = cx + (int)(sin(deg2rad(brg)) * rr);
     int by = cy - (int)(cos(deg2rad(brg)) * rr);
-    bool isTarget = ap && strcmp(ap->callsign, blips[i].callsign) == 0;
+    blipVis[i] = true; blipSX[i] = SCOPE_X + bx; blipSY[i] = SCOPE_Y + by;
+    bool isTarget = ap && strcmp(ap->hex, blips[i].hex) == 0;
     if (isTarget) {
       radarSpr.drawCircle(bx, by, 11, C_CYAN);
       drawPlaneGlyph(radarSpr, bx, by, 8, blips[i].track - 90, C_CYAN);
@@ -2033,6 +2333,262 @@ void screenSettings(bool newPage) {
   tft.setTextFont(2);
 }
 
+// ===========================================================================
+// 6. CLOCK (as a page, or when no aircraft are nearby)
+// ===========================================================================
+void clockString(char* buf, size_t n, const struct tm& lt, bool* pm = nullptr) {
+  if (scr.clock24) { strftime(buf, n, "%H:%M", &lt); return; }
+  int h = lt.tm_hour % 12; if (h == 0) h = 12;
+  snprintf(buf, n, "%d:%02d", h, lt.tm_min);
+  if (pm) *pm = lt.tm_hour >= 12;
+}
+
+// Bottom cards shared by both clock styles: weather and today's count
+void clockInfoCards(int x, int y, int w, bool newPage) {
+  static uint32_t lastMs = 0;
+  if (!newPage && millis() - lastMs < 10000) return;
+  lastMs = millis();
+  int cw = (w - 4) / 2;
+  card(x, y, cw, 82); card(x + cw + 4, y, cw, 82);
+  label("WEATHER", x + 8, y + 6); label("TODAY", x + cw + 12, y + 6);
+  char buf[40];
+  if (weather.valid) {
+    weatherIcon(x + 26, y + 46, weather.code);
+    tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(C_TEXT, C_PANEL);
+    snprintf(buf, sizeof(buf), "%d", (int)lroundf(weather.temp));
+    tft.drawString(buf, x + 54, y + 24);
+    int tw = tft.textWidth(buf); degree(x + 54 + tw + 4, y + 28, 3, C_TEXT);
+    tft.setTextFont(2); tft.setTextColor(C_SOFT, C_PANEL);
+    tft.drawString(fitPx(wmoText(weather.code), cw - 58), x + 54, y + 52);
+  }
+  uint32_t total = 0; char note[40] = "";
+  if (logMutex) xSemaphoreTake(logMutex, portMAX_DELAY);
+  if (dayLog.yday >= 0) {
+    total = dayLog.total;
+    if (dayLog.nNotable) {
+      const LogNotable& n = dayLog.notable[dayLog.nNotable - 1];
+      snprintf(note, sizeof(note), "%s %s", n.cs, n.type);
+    }
+  }
+  if (logMutex) xSemaphoreGive(logMutex);
+  int tx = x + cw + 12;
+  tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(C_TEXT, C_PANEL);
+  tft.drawString(withCommas(total), tx, y + 20);
+  tft.setTextFont(2); tft.setTextColor(C_SOFT, C_PANEL);
+  tft.drawString("aircraft", tx, y + 44);
+  if (note[0]) { tft.setTextColor(C_CYAN, C_PANEL); tft.drawString(fitPx(note, cw - 16), tx, y + 60); }
+}
+
+void screenClock(bool newPage) {
+  time_t now = time(nullptr); struct tm lt; localtime_r(&now, &lt);
+  bool have = timeReady();
+  static int lastYday = -1;
+  if (have && lt.tm_yday != lastYday) { lastYday = lt.tm_yday; if (!newPage) { tft.fillScreen(C_BG); newPage = true; } }
+  char title[32] = "CLOCK";
+  if (have) { strftime(title, sizeof(title), "%A, %b %d", &lt); for (char* c = title; *c; c++) *c = toupper(*c); }
+  drawHeader(title, newPage);
+
+  static int lastSec = -1;
+  if (newPage) { tft.fillRect(0, 26, 320, 214, C_BG); lastSec = -1; }
+  if (!have) {
+    if (newPage) { tft.setTextFont(2); tft.setTextColor(C_SOFT, C_BG); tft.drawString("Waiting for the time...", 90, 110); }
+    return;
+  }
+
+  if (scr.clockStyle == 2) {                     // ---- analog
+    const int cx = 100, cy = 131, R = 96;
+    static float lh = -1, lm = -1, ls = -1;
+    if (newPage) {
+      tft.fillCircle(cx, cy, R, C_PANEL); tft.drawCircle(cx, cy, R, C_EDGE); tft.drawCircle(cx, cy, R - 1, C_EDGE);
+      for (int k = 0; k < 60; k++) {
+        float a = k * 6 * PI / 180;
+        int r1 = k % 5 ? R - 6 : R - 13;
+        tft.drawLine(cx + sinf(a) * r1, cy - cosf(a) * r1, cx + sinf(a) * (R - 3), cy - cosf(a) * (R - 3), k % 5 ? C_TRACK : C_SOFT);
+      }
+      lh = lm = ls = -1;
+    }
+    if (lt.tm_sec != lastSec) {
+      lastSec = lt.tm_sec;
+      auto hand = [&](float ang, int len, int w, uint16_t c) {
+        float a = ang * PI / 180;
+        int x2 = cx + sinf(a) * len, y2 = cy - cosf(a) * len;
+        if (w > 1) tft.drawWideLine(cx, cy, x2, y2, w, c, C_PANEL); else tft.drawLine(cx, cy, x2, y2, c);
+      };
+      float h = (lt.tm_hour % 12) * 30 + lt.tm_min * 0.5f, m = lt.tm_min * 6 + lt.tm_sec * 0.1f, sd = lt.tm_sec * 6;
+      if (ls >= 0) { hand(ls, R - 18, 1, C_PANEL); hand(lm, R - 22, 4, C_PANEL); hand(lh, R - 46, 6, C_PANEL); }
+      hand(h, R - 46, 6, C_TEXT); hand(m, R - 22, 4, C_TEXT); hand(sd, R - 18, 1, C_CYAN);
+      tft.fillCircle(cx, cy, 5, C_CYAN);
+      lh = h; lm = m; ls = sd;
+
+      char t[8]; bool pm = false; clockString(t, sizeof(t), lt, &pm);
+      tft.setFreeFont(&FreeSansBold18pt7b); tft.setTextColor(C_TEXT, C_BG); tft.setTextDatum(TC_DATUM);
+      tft.setTextPadding(112); tft.drawString(t, 262, 40); tft.setTextPadding(0);
+      tft.setTextFont(2); tft.setTextColor(C_SOFT, C_BG);
+      char d[16]; strftime(d, sizeof(d), "%b %d", &lt);
+      tft.setTextPadding(112); tft.drawString(scr.clock24 ? String(d) : String(pm ? "PM  " : "AM  ") + d, 262, 76); tft.setTextPadding(0);
+      tft.setTextDatum(TL_DATUM);
+    }
+    clockInfoCards(204, 104, 112, newPage);
+    return;
+  }
+
+  // ---- digital (optionally with seconds)
+  static char lastT[8] = "";
+  if (newPage) lastT[0] = '\0';
+  char t[8]; bool pm = false; clockString(t, sizeof(t), lt, &pm);
+  if (strcmp(t, lastT) != 0) {
+    strcpy(lastT, t);
+    tft.setTextDatum(TC_DATUM); tft.setTextColor(C_TEXT, C_BG); tft.setTextPadding(262);
+    tft.drawString(t, 140, 44, 8);
+    tft.setTextPadding(0);
+    if (!scr.clock24) {
+      tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(C_CYAN, C_BG);
+      tft.drawString(pm ? "PM" : "AM", 296, 50);
+    }
+    tft.setTextDatum(TL_DATUM);
+  }
+  if (scr.clockStyle == 1 && lt.tm_sec != lastSec) {
+    lastSec = lt.tm_sec;
+    char sbuf[4]; snprintf(sbuf, sizeof(sbuf), "%02d", lt.tm_sec);
+    tft.setFreeFont(&FreeSansBold18pt7b); tft.setTextColor(C_CYAN, C_BG); tft.setTextDatum(TC_DATUM);
+    tft.setTextPadding(48); tft.drawString(sbuf, 294, 86); tft.setTextPadding(0);
+    tft.setTextDatum(TL_DATUM);
+  }
+  clockInfoCards(4, 150, 312, newPage);
+}
+
+// ===========================================================================
+// 7. METAR (nearest or chosen station)
+// ===========================================================================
+void screenMetar(bool newPage) {
+  static char lastId[5] = ""; static uint32_t lastObs = 0; static int lastAgeMin = -1;
+  if (strcmp(lastId, metar.id) != 0) { strcpy(lastId, metar.id); if (!newPage) { tft.fillScreen(C_BG); newPage = true; } }
+  char title[24]; snprintf(title, sizeof(title), metar.valid ? "METAR %s" : "METAR", metar.id);
+  drawHeader(title, newPage);
+  if (newPage) { tft.fillRect(0, 26, 320, 214, C_BG); lastObs = 0; lastAgeMin = -1; }
+
+  if (!metar.valid) {
+    static char lastErr[48] = "";
+    if (newPage || strcmp(lastErr, metarErr) != 0) {
+      strcpy(lastErr, metarErr);
+      tft.fillRect(0, 100, 320, 40, C_BG);
+      tft.setTextFont(2); tft.setTextDatum(TC_DATUM); tft.setTextColor(C_SOFT, C_BG);
+      tft.drawString(metarErr[0] ? metarErr : "Loading weather report...", 160, 104);
+      tft.setTextDatum(TL_DATUM);
+    }
+    return;
+  }
+
+  int ageMin = timeReady() && metar.obs ? (int)((time(nullptr) - (time_t)metar.obs) / 60) : -1;
+  if (metar.obs != lastObs) {
+    lastObs = metar.obs; lastAgeMin = -1;
+    tft.fillRect(0, 26, 320, 214, C_BG);
+    card(4, 29, 312, 46);
+    tft.setTextFont(2); tft.setTextColor(C_TEXT, C_PANEL);
+    tft.drawString(fitPx(metar.name, 230), 12, 34);
+    // Flight category pill
+    uint16_t cc = C_PILLOK, cf = TFT_BLACK;
+    if (!strcmp(metar.cat, "MVFR")) { cc = C_BLUEB; cf = TFT_WHITE; }
+    else if (!strcmp(metar.cat, "IFR")) { cc = TFT_RED; cf = TFT_WHITE; }
+    else if (!strcmp(metar.cat, "LIFR")) { cc = TFT_MAGENTA; cf = TFT_WHITE; }
+    if (metar.cat[0]) pill(250, 41, 58, 22, metar.cat, cc, cf);
+
+    char v[24];
+    const int TW = 101, TH = 58;
+    int tx[3] = {4, 109, 214};
+    for (int r = 0; r < 2; r++) for (int c = 0; c < 3; c++) card(tx[c], 79 + r * (TH + 4), c == 2 ? 102 : TW, TH);
+    label("WIND KT", tx[0] + 8, 85); label("VISIBILITY", tx[1] + 8, 85); label("CEILING FT", tx[2] + 8, 85);
+    label("TEMP / DEW", tx[0] + 8, 147); label("ALTIMETER", tx[1] + 8, 147); label("OBSERVED", tx[2] + 8, 147);
+
+    tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(C_TEXT, C_PANEL);
+    if (metar.wspd == 0) snprintf(v, sizeof(v), "Calm");
+    else if (metar.wdir < 0) snprintf(v, sizeof(v), metar.wgst ? "VRB %dG%d" : "VRB %d", metar.wspd, metar.wgst);
+    else snprintf(v, sizeof(v), metar.wgst ? "%03d/%dG%d" : "%03d/%d", metar.wdir, metar.wspd, metar.wgst);
+    tft.drawString(fitPx(v, TW - 12), tx[0] + 8, 102);
+    snprintf(v, sizeof(v), "%s SM", metar.visib);
+    tft.drawString(fitPx(v, TW - 12), tx[1] + 8, 102);
+    tft.setFreeFont(&FreeSansBold9pt7b);
+    tft.drawString(fitPx(metar.ceiling, 90), tx[2] + 8, 106);
+
+    tft.setFreeFont(&FreeSansBold12pt7b);
+#if UNITS_IMPERIAL
+    snprintf(v, sizeof(v), "%d/%d", (int)lroundf(metar.temp * 9 / 5 + 32), (int)lroundf(metar.dewp * 9 / 5 + 32));
+#else
+    snprintf(v, sizeof(v), "%d/%d", (int)lroundf(metar.temp), (int)lroundf(metar.dewp));
+#endif
+    tft.drawString(v, tx[0] + 8, 164);
+    tft.setTextFont(2); tft.setTextColor(C_SOFT, C_PANEL);
+    tft.drawString(UNITS_IMPERIAL ? "deg F" : "deg C", tx[0] + 8 + 2, 188);
+    tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(C_TEXT, C_PANEL);
+#if UNITS_IMPERIAL
+    snprintf(v, sizeof(v), "%.2f", metar.altim * 0.0295300f);
+    tft.drawString(v, tx[1] + 8, 164);
+    tft.setTextFont(2); tft.setTextColor(C_SOFT, C_PANEL); tft.drawString("inHg", tx[1] + 10, 188);
+#else
+    snprintf(v, sizeof(v), "%d", (int)lroundf(metar.altim));
+    tft.drawString(v, tx[1] + 8, 164);
+    tft.setTextFont(2); tft.setTextColor(C_SOFT, C_PANEL); tft.drawString("hPa", tx[1] + 10, 188);
+#endif
+
+    // Raw report, wrapped by words into 3 lines
+    card(4, 203, 312, 35);
+    tft.setTextFont(1); tft.setTextColor(C_SOFT, C_PANEL);
+    const char* p = metar.raw; int line = 0;
+    while (*p && line < 3) {
+      int len = strlen(p), cut = len > 50 ? 50 : len;
+      if (len > 50) { while (cut > 0 && p[cut] != ' ') cut--; if (cut == 0) cut = 50; }
+      char buf[52]; memcpy(buf, p, cut); buf[cut] = '\0';
+      tft.drawString(buf, 10, 207 + line * 10);
+      p += cut; while (*p == ' ') p++; line++;
+    }
+  }
+  if (ageMin != lastAgeMin) {
+    lastAgeMin = ageMin;
+    char v[24];
+    tft.fillRect(222, 162, 88, 40, C_PANEL);
+    tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(ageMin > 90 ? C_WARN : C_TEXT, C_PANEL);
+    if (ageMin < 0) snprintf(v, sizeof(v), "--");
+    else if (ageMin < 120) snprintf(v, sizeof(v), "%d min", ageMin);
+    else snprintf(v, sizeof(v), "%d h", ageMin / 60);
+    tft.drawString(v, 222, 164);
+    tft.setTextFont(2); tft.setTextColor(C_SOFT, C_PANEL);
+    tft.drawString("ago", 224, 188);
+    tft.fillRect(12, 52, 230, 18, C_PANEL);
+    if (metar.obs) {
+      time_t o = metar.obs; struct tm lt; localtime_r(&o, &lt);
+      char t[12]; clockString(t, sizeof(t), lt);
+      tft.drawString(String("Observed ") + t + "  " + metar.id, 12, 53);
+    }
+  }
+}
+
+// ---- Banner over the header: emergency squawk (red, blinking) or a new collection type
+void updateBanner() {
+  static int shown = 0; static uint32_t lastDraw = 0; static uint8_t lastScr = 255;
+  Emergency em;
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+  em = emergency;
+  if (dataMutex) xSemaphoreGive(dataMutex);
+  int want = (emergencyBanner && em.on) ? 1 : stillBefore(newTypeBannerUntil) ? 2 : 0;
+  if (screen == SCREEN_SETTINGS) want = 0;
+  if (!want) { if (shown) { shown = 0; lastScreen = 255; } return; }
+  if (want == shown && screen == lastScr && millis() - lastDraw < 250) return;
+  shown = want; lastScr = screen; lastDraw = millis();
+  char t[64]; uint16_t bg, fg;
+  if (want == 1) {
+    bool on = (millis() / 500) % 2;
+    bg = on ? TFT_RED : 0x8000; fg = TFT_WHITE;
+    snprintf(t, sizeof(t), "%s %s  %s  %.1f %s %s", em.squawk, em.what, em.cs, em.km / KM_PER_UNIT, DIST_UNIT, compass(em.brg));
+  } else {
+    bg = C_CYAN; fg = C_BG;
+    snprintf(t, sizeof(t), "%s", newTypeBanner);
+  }
+  tft.fillRect(0, 0, 320, 25, bg);
+  tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(fg, bg); tft.setTextDatum(MC_DATUM);
+  tft.drawString(fitPx(t, 312), 160, 12);
+  tft.setTextDatum(TL_DATUM); tft.setTextFont(2);
+}
+
 void render() {
   bool newPage = false;
   if (screen != lastScreen) {
@@ -2044,11 +2600,13 @@ void render() {
   // Take mutex for the duration of rendering so we see a consistent snapshot
   if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
   switch (screen) {
-    case 0: screenTargetIntel(newPage); break;
-    case 1: screenTop5(newPage);        break;
-    case 2: screenRadar(newPage);       break;
-    case 3: screenWeatherSystem(newPage); break;
-    case 4: screenSettings(newPage);    break;
+    case S_NEAREST: screenTargetIntel(newPage); break;
+    case S_TRAFFIC: screenTop5(newPage);        break;
+    case S_RADAR:   screenRadar(newPage);       break;
+    case S_WEATHER: screenWeatherSystem(newPage); break;
+    case S_CLOCK:   screenClock(newPage);       break;
+    case S_METAR:   screenMetar(newPage);       break;
+    case SCREEN_SETTINGS: screenSettings(newPage); break;
   }
   if (dataMutex) xSemaphoreGive(dataMutex);
 }
@@ -2060,6 +2618,7 @@ struct RGB { uint8_t r, g, b; };
 
 RGB alertColor(AlertKind k) {
   switch (k) {
+    case ALERT_EMERG:       return {255, 0, 0};      // red
     case ALERT_WATCH:       return {255, 255, 255};  // white
     case ALERT_MILITARY:    return {255, 0, 255};    // magenta
     case ALERT_INTERESTING: return {255, 80, 0};     // orange
@@ -2132,6 +2691,13 @@ void ledUpdate() {
 
   // Night mode: LED off
   if (nightCfg.ledOff && nightNow()) { ledSet({0, 0, 0}, lc.brightness); return; }
+
+  // Emergency squawk in the area: fast red blink while it lasts
+  bool emOn;
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+  emOn = emergency.on;
+  if (dataMutex) xSemaphoreGive(dataMutex);
+  if (lc.alerts && emOn) { ledSet(((now / 200) % 2) ? RGB{255, 0, 0} : RGB{0, 0, 0}, lc.brightness); return; }
 
   // New special aircraft in range -> blink 8 times in its color
   if (lc.alerts && al.kind != ALERT_NONE && !alreadyAlerted(al.callsign)) {
@@ -2527,6 +3093,39 @@ void handleMenuButton(int b) {
   }
 }
 
+// ---- Pages: the four main ones, plus clock / METAR when shown "as a page" ----
+bool pageEnabled(int i) {
+  if (i == S_CLOCK) return scr.clockShow == SHOW_PAGE;
+  if (i == S_METAR) return scr.metarShow == SHOW_PAGE;
+  return i >= 0 && i < NUM_SCREENS;
+}
+uint8_t nextPage(uint8_t from, int dir) {
+  int i = from >= NUM_SCREENS ? 0 : from;
+  for (int k = 0; k < NUM_SCREENS; k++) {
+    i = (i + dir + NUM_SCREENS) % NUM_SCREENS;
+    if (pageEnabled(i)) return i;
+  }
+  return S_NEAREST;
+}
+
+// Select an aircraft (by ICAO address) and show its card
+void selectAircraft(const char* hex, const Blip* b) {
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+  copyAscii(selectedHex, hex, sizeof(selectedHex));
+  selectedUntil = millis() + SELECT_MS;
+  if (b) {                           // show what the radar knows right away; details follow
+    Aircraft a = {};
+    a.valid = true; copyAscii(a.hex, hex, sizeof(a.hex));
+    copyAscii(a.callsign, b->callsign[0] ? b->callsign : "(no id)", sizeof(a.callsign));
+    a.lat = b->lat; a.lon = b->lon; a.altFt = b->altFt; a.gsKt = b->speedKt; a.trackDeg = b->track;
+    a.distanceKm = b->distKm; a.bearingDeg = bearingDeg(homeLat, homeLon, b->lat, b->lon);
+    selAc = a;
+  }
+  if (dataMutex) xSemaphoreGive(dataMutex);
+  selectRequested = true;
+  screen = S_NEAREST;
+}
+
 // ---- On-screen navigation arrows ----
 const int NAV_Y = 95, NAV_H = 50, NAV_W = 36;
 bool navVisible() { return navButtons && screen != SCREEN_SETTINGS && stillBefore(navShownUntil); }
@@ -2585,13 +3184,13 @@ void checkTouch() {
   // Visible navigation arrows come first: they are drawn over the page
   bool arrowsShown = navVisible();
   if (arrowsShown && sy >= NAV_Y - 15 && sy < NAV_Y + NAV_H + 15) {
-    if (sx < NAV_W + 20)        { navShownUntil = millis() + NAV_TIMEOUT_MS; screen = (screen + NUM_SCREENS - 1) % NUM_SCREENS; return; }
-    if (sx >= 320 - NAV_W - 20) { navShownUntil = millis() + NAV_TIMEOUT_MS; screen = (screen + 1) % NUM_SCREENS; return; }
+    if (sx < NAV_W + 20)        { navShownUntil = millis() + NAV_TIMEOUT_MS; screen = nextPage(screen, -1); return; }
+    if (sx >= 320 - NAV_W - 20) { navShownUntil = millis() + NAV_TIMEOUT_MS; screen = nextPage(screen, 1); return; }
   }
   if (navButtons) navShownUntil = millis() + NAV_TIMEOUT_MS;
 
   // Radar screen: range preset buttons on the left
-  if (screen == 2 && sx < RB_X + RB_W + 6 && sy >= RB_Y - 3) {
+  if (screen == S_RADAR && sx < RB_X + RB_W + 6 && sy >= RB_Y - 3) {
     int k = constrain((sy - RB_Y + 3) / RB_STEP, 0, 3);
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
     radarRange = RANGE_PRESETS[k];
@@ -2602,23 +3201,31 @@ void checkTouch() {
 
   // Traffic screen: tap a row to show that aircraft on the first page
   // (the header strip and empty space below the rows still flip to the next page)
-  if (screen == 1 && sy >= TR_Y) {
+  if (screen == S_TRAFFIC && sy >= TR_Y) {
     int row = (sy - TR_Y) / TR_STEP;
     if (row < top5Count && sy - TR_Y - row * TR_STEP <= TR_H) {
-      if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
-      strcpy(selectedCs, top5[row].callsign);
-      if (dataMutex) xSemaphoreGive(dataMutex);
-      selectedUntil = millis() + SELECT_MS;
-      screen = 0;
+      char hex[8]; strcpy(hex, top5[row].hex);
+      selectAircraft(hex, nullptr);
       return;
     }
+  }
+
+  // Radar: tap an aircraft to open its card (the nearest blip within 18 px)
+  if (screen == S_RADAR && sx >= SCOPE_X && sx < SCOPE_X + SCOPE && sy >= SCOPE_Y && sy < SCOPE_Y + SCOPE) {
+    int best = -1, bestD = 18 * 18;
+    for (int i = 0; i < blipCount; i++) {
+      if (!blipVis[i] || !blips[i].hex[0]) continue;
+      int dx = blipSX[i] - sx, dy = blipSY[i] - sy, dd = dx * dx + dy * dy;
+      if (dd < bestD) { bestD = dd; best = i; }
+    }
+    if (best >= 0) { Blip b = blips[best]; selectAircraft(b.hex, &b); return; }
   }
 
   // Navigation arrows mode: other taps only show the arrows; only the arrows switch pages
   if (navButtons) return;
 
   // Anywhere else: next screen
-  screen = (screen + 1) % NUM_SCREENS;
+  screen = nextPage(screen, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -2738,10 +3345,16 @@ void initWebServer() {
     lc = ledCfg;
     if (configMutex) xSemaphoreGive(configMutex);
     auto chk = [](bool b) { return b ? String(" checked") : String(""); };
-    NotifyConfig nc;
+    NotifyConfig nc; ScreensConfig sc;
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-    nc = notifyCfg;
+    nc = notifyCfg; sc = scr;
     if (configMutex) xSemaphoreGive(configMutex);
+    auto showOpts = [](uint8_t v) {
+      const char* n[] = {"Off", "As a page", "Only when no aircraft are nearby"};
+      String o;
+      for (int i = 0; i < 3; i++) o += String("<option value=\"") + i + "\"" + (v == i ? " selected" : "") + ">" + n[i] + "</option>";
+      return o;
+    };
     auto hhmm = [](uint16_t m) { char b[8]; snprintf(b, sizeof(b), "%02u:%02u", (m / 60) % 24, m % 60); return String(b); };
     auto sel = [](bool b) { return b ? String(" selected") : String(""); };
     String themeOptions;
@@ -2850,6 +3463,8 @@ void initWebServer() {
     <label class="chk"><input type="checkbox" id="nc2")rawliteral" + chk(nc.cats & NT_MIL) + R"rawliteral(> Military</label>
     <label class="chk"><input type="checkbox" id="nc4")rawliteral" + chk(nc.cats & NT_INTR) + R"rawliteral(> Government / rare aircraft</label>
     <label class="chk"><input type="checkbox" id="nc8")rawliteral" + chk(nc.cats & NT_HELI) + R"rawliteral(> Helicopters</label>
+    <label class="chk"><input type="checkbox" id="nc32")rawliteral" + chk(nc.cats & NT_EMERG) + R"rawliteral(> Emergency squawks (any distance, also at night)</label>
+    <label class="chk"><input type="checkbox" id="nc64")rawliteral" + chk(nc.cats & NT_NEWTYPE) + R"rawliteral(> New type for my collection (after its first day)</label>
     <label class="chk"><input type="checkbox" id="nc16")rawliteral" + chk(nc.cats & NT_LOW) + R"rawliteral(> Lower than <input type="number" step="100" min="100" max="20000" id="nlo" value=")rawliteral" + String(nc.lowAltFt) + R"rawliteral(" style="width:90px;padding:4px;margin:0 4px"> ft</label>
   </div>
   <label>Same aircraft again after</label>
@@ -2864,6 +3479,34 @@ void initWebServer() {
   <div class="hint" id="nst">)rawliteral" + String(notifyStatus) + R"rawliteral(</div>
   <button type="button" onclick="saveNotify()">Save notifications</button>
   <button type="button" class="opt" style="text-align:center" onclick="testNotify()">Send test notification</button>
+</div>
+<div class="card">
+  <h2>Screens</h2>
+  <label class="chk"><input type="checkbox" id="sro")rawliteral" + chk(sc.rotate) + R"rawliteral(> Flip pages automatically every <input type="number" min="5" max="600" id="srs" value=")rawliteral" + String(sc.rotateSec) + R"rawliteral(" style="width:70px;padding:4px;margin:0 4px"> s</label>
+  <div class="hint">Pauses for a minute after you touch the screen.</div>
+  <label>Clock screen</label>
+  <select id="scs" style="width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em">)rawliteral" + showOpts(sc.clockShow) + R"rawliteral(</select>
+  <div class="row" style="margin-top:4px"><div style="flex:1"><label>Style</label><select id="sst" style="width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em">
+    <option value="0")rawliteral" + sel(sc.clockStyle == 0) + R"rawliteral(>Digital</option>
+    <option value="1")rawliteral" + sel(sc.clockStyle == 1) + R"rawliteral(>Digital with seconds</option>
+    <option value="2")rawliteral" + sel(sc.clockStyle == 2) + R"rawliteral(>Analog</option></select></div>
+  <div style="flex:1"><label>&nbsp;</label><label class="chk"><input type="checkbox" id="s24")rawliteral" + chk(sc.clock24) + R"rawliteral(> 24-hour</label></div></div>
+  <label>METAR screen (airport weather report)</label>
+  <select id="sms" style="width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em">)rawliteral" + showOpts(sc.metarShow) + R"rawliteral(</select>
+  <label>Airport (ICAO code, empty = nearest)</label>
+  <input id="smi" maxlength="4" placeholder="e.g. KORD" value=")rawliteral" + String(sc.metarIcao) + R"rawliteral(" style="text-transform:uppercase">
+  <label>"No aircraft nearby" means none within ()rawliteral" + String(DIST_UNIT) + R"rawliteral()</label>
+  <input type="number" step="1" min="1" max="100" id="sir" value=")rawliteral" + String((int)sc.idleRange) + R"rawliteral(">
+  <label class="chk"><input type="checkbox" id="seb")rawliteral" + chk(emergencyBanner) + R"rawliteral(> Red banner for emergency squawks (7500 / 7600 / 7700)</label>
+  <button type="button" onclick="saveScreens()">Save screens</button>
+</div>
+<div class="card">
+  <h2>Collection</h2>
+  <div id="col" style="font-size:0.9em;color:#aaa">Loading...</div>
+  <input id="colq" placeholder="Filter, e.g. Boeing or B7" style="margin-top:8px" oninput="colShow()">
+  <div id="coll" style="font-size:0.9em;margin-top:6px;max-height:420px;overflow:auto"></div>
+  <div class="hint" style="margin-top:8px"><a style="color:#00c8ff" href="/types.csv" download="collection.csv">Download CSV</a></div>
+  <button type="button" class="opt danger" style="text-align:center" onclick="colReset()">Start the collection over</button>
 </div>
 <div class="card">
   <h2>Theme</h2>
@@ -2990,7 +3633,7 @@ function nLink(){
 $('ntp').addEventListener('input',nLink);$('nsv').addEventListener('input',nLink);nLink();
 function rndTopic(){var c='abcdefghijkmnpqrstuvwxyz23456789',t='planes-';for(var i=0;i<10;i++)t+=c[Math.floor(Math.random()*c.length)];$('ntp').value=t;nLink()}
 function nBody(){
-  var c=0;[1,2,4,8,16].forEach(function(b){if($('nc'+b).checked)c|=b});
+  var c=0;[1,2,4,8,16,32,64].forEach(function(b){if($('nc'+b).checked)c|=b});
   return 'on='+($('non').checked?1:0)+'&topic='+encodeURIComponent($('ntp').value.trim())+'&server='+encodeURIComponent($('nsv').value.trim())+
     '&range='+encodeURIComponent($('nrg').value)+'&cats='+c+'&low='+encodeURIComponent($('nlo').value)+'&cool='+$('ncl').value+'&quiet='+($('nqt').checked?1:0);
 }
@@ -3002,6 +3645,42 @@ function testNotify(){
     post('/notify-test','',function(){setTimeout(function(){fetch('/notify-status').then(function(r){return r.text()}).then(function(t){$('nst').textContent=t})},4000)});
   });
 }
+function saveScreens(){
+  var b=function(i){return $(i).checked?1:0};
+  post('/screens','ro='+b('sro')+'&rs='+$('srs').value+'&cs='+$('scs').value+'&st='+$('sst').value+'&c24='+b('s24')+
+    '&ms='+$('sms').value+'&mi='+encodeURIComponent($('smi').value.trim().toUpperCase())+'&ir='+$('sir').value+'&eb='+b('seb'),
+    function(x){flash(x.status==200?'✓ Screens saved!':x.responseText)});
+}
+var colRows=[];
+function colLoad(){
+  fetch('/types.csv').then(function(x){return x.ok?x.text():''}).then(function(t){
+    colRows=t.split('\n').filter(function(l){return l.indexOf(',')>0}).map(function(l){var f=l.split(',');
+      return {t:f[0],at:+f[1],hex:f[2]||'',cs:f[3]||'',reg:f[4]||'',m:f[5]||''}}).reverse();
+    var first=colRows.length?colRows[colRows.length-1].at:0;
+    $('col').innerHTML=colRows.length?'<b style="color:#fff;font-size:1.4em">'+colRows.length+'</b> aircraft types since '+new Date(first*1000).toLocaleDateString():'No types yet - they are added as aircraft fly by.';
+    colShow();
+  }).catch(function(){$('col').textContent='Could not load'});
+}
+function colShow(){
+  var q=$('colq').value.trim().toLowerCase(),h='',n=0;
+  colRows.forEach(function(r){
+    if(q&&(r.t+' '+r.m+' '+r.cs+' '+r.reg).toLowerCase().indexOf(q)<0)return;
+    if(++n>300)return;
+    var L=function(u,t){return '<a style="color:#00c8ff" target="_blank" href="'+u+'">'+t+'</a>'};
+    var links=[L('https://en.wikipedia.org/wiki/Special:Search?search='+encodeURIComponent(r.m||(r.t+' aircraft')),'About the type')];
+    if(r.reg)links.push(L('https://www.planespotters.net/search?q='+encodeURIComponent(r.reg),'Photos of '+esc(r.reg)));
+    if(r.hex)links.push(L('https://globe.airplanes.live/?icao='+r.hex,'Map'));
+    h+='<div style="padding:8px 0;border-bottom:1px solid #1f3b57"><b style="color:#fff">'+esc(r.t)+'</b> '+esc(r.m)+
+      ' <span style="color:#777;float:right">'+new Date(r.at*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})+'</span><br>'+
+      '<span style="color:#aaa">'+esc(r.cs)+'</span> &middot; '+links.join(' &middot; ')+'</div>';
+  });
+  $('coll').innerHTML=h;
+}
+function colReset(){
+  if(!confirm('Delete the whole collection and start over?'))return;
+  post('/collection-reset','',function(){setTimeout(colLoad,1500);flash('Collection cleared')});
+}
+colLoad();
 function saveTheme(){
   post('/theme','t='+$('thm').value+'&nr='+($('thr').checked?1:0),function(x){flash(x.status==200?'✓ Theme saved!':x.responseText)});
 }
@@ -3189,7 +3868,7 @@ function forget(){
       server.send(400, "text/plain", "Server must start with https://"); return;
     }
     n.range = server.arg("range").toFloat();
-    n.cats = server.arg("cats").toInt() & 31;
+    n.cats = server.arg("cats").toInt() & 127;
     n.lowAltFt = server.arg("low").toInt();
     int cool = server.arg("cool").toInt();
     n.quietNight = server.arg("quiet") == "1";
@@ -3218,6 +3897,46 @@ function forget(){
     server.send(200, "text/plain", "OK");
   });
   server.on("/notify-status", HTTP_GET, []() { server.send(200, "text/plain", notifyStatus); });
+
+  // POST /screens — page rotation, clock and METAR screens, emergency banner
+  server.on("/screens", HTTP_POST, []() {
+    ScreensConfig c;
+    c.rotate = server.arg("ro") == "1";
+    int rs = server.arg("rs").toInt(), cs = server.arg("cs").toInt(), st = server.arg("st").toInt(), ms = server.arg("ms").toInt();
+    float ir = server.arg("ir").toFloat();
+    String mi = server.arg("mi"); mi.trim(); mi.toUpperCase();
+    bool icaoOk = mi.length() == 0 || mi.length() == 4;
+    for (unsigned i = 0; i < mi.length(); i++) if (!isalnum((uint8_t)mi[i])) icaoOk = false;
+    if (rs < 5 || rs > 600 || cs < 0 || cs > 2 || st < 0 || st > 2 || ms < 0 || ms > 2 || ir < 1 || ir > 100 || !icaoOk) {
+      server.send(400, "text/plain", "Invalid values (airport: 4-letter ICAO code or empty)"); return;
+    }
+    c.rotateSec = rs; c.clockShow = cs; c.clockStyle = st; c.clock24 = server.arg("c24") == "1";
+    c.metarShow = ms; copyAscii(c.metarIcao, mi.c_str(), sizeof(c.metarIcao)); c.idleRange = ir;
+    bool metarChanged = strcmp(c.metarIcao, scr.metarIcao) != 0 || (c.metarShow != SHOW_OFF && scr.metarShow == SHOW_OFF);
+    if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+    scr = c;
+    if (configMutex) xSemaphoreGive(configMutex);
+    emergencyBanner = server.arg("eb") == "1";
+    prefs.putBool("rot_on", c.rotate); prefs.putUShort("rot_sec", c.rotateSec);
+    prefs.putUChar("clk_show", c.clockShow); prefs.putUChar("clk_style", c.clockStyle); prefs.putBool("clk_24", c.clock24);
+    prefs.putUChar("mtr_show", c.metarShow); prefs.putString("mtr_icao", c.metarIcao); prefs.putFloat("idle_rng", c.idleRange);
+    prefs.putBool("emg_on", emergencyBanner);
+    if (metarChanged) { if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY); metar = Metar(); if (dataMutex) xSemaphoreGive(dataMutex); metarErr[0] = '\0'; metarRequested = true; }
+    lastScreen = 255;
+    server.send(200, "text/plain", "OK");
+  });
+
+  // Collection: the CSV file, and starting over
+  server.on("/types.csv", HTTP_GET, []() {
+    File f = fsOk ? LittleFS.open("/types.csv", "r") : File();
+    if (!f) { server.send(200, "text/csv", ""); return; }
+    server.streamFile(f, "text/csv");
+    f.close();
+  });
+  server.on("/collection-reset", HTTP_POST, []() {
+    collectionResetRequested = true;
+    server.send(200, "text/plain", "OK");
+  });
 
   // POST /theme — color theme
   server.on("/theme", HTTP_POST, []() {
@@ -3419,6 +4138,18 @@ void setup() {
   PREF("ntf_low", getInt, notifyCfg.lowAltFt);
   PREF("ntf_cool", getUChar, notifyCfg.coolH);
   PREF("ntf_quiet", getBool, notifyCfg.quietNight);
+  PREF("rot_on", getBool, scr.rotate);
+  PREF("rot_sec", getUShort, scr.rotateSec);
+  PREF("clk_show", getUChar, scr.clockShow);
+  PREF("clk_style", getUChar, scr.clockStyle);
+  PREF("clk_24", getBool, scr.clock24);
+  PREF("mtr_show", getUChar, scr.metarShow);
+  if (prefs.isKey("mtr_icao")) copyAscii(scr.metarIcao, prefs.getString("mtr_icao").c_str(), sizeof(scr.metarIcao));
+  PREF("idle_rng", getFloat, scr.idleRange);
+  PREF("emg_on", getBool, emergencyBanner);
+  PREF("col_start", getUInt, colStart);
+  // Notification kinds added in 1.5 are on by default for existing setups too
+  if (!prefs.isKey("ntf_v2")) { notifyCfg.cats |= NT_EMERG | NT_NEWTYPE; prefs.putBool("ntf_v2", true); prefs.putUChar("ntf_cats", notifyCfg.cats); }
   PREF("theme", getUChar, themeIdx);
   if (themeIdx >= NUM_THEMES) themeIdx = 0;
   PREF("night_red", getBool, nightRedTheme);
@@ -3447,6 +4178,11 @@ void setup() {
 
   nearest.valid = false;
 
+  // Internal file system (the 128 KB "spiffs" partition) for the type collection
+  fsOk = LittleFS.begin(true);
+  Serial.printf("LittleFS: %s\n", fsOk ? "mounted" : "failed");
+  if (fsOk) collectionLoad();
+
   initWebServer();
   setupArduinoOta();
 
@@ -3460,6 +4196,46 @@ void setup() {
     &fetchTaskHandle,  // Handle
     0                  // Core 0 — leaves Core 1 free for rendering
   );
+}
+
+// Page rotation and the "no aircraft nearby" screens (clock / METAR)
+void autoScreens() {
+  static bool idle = false; static uint8_t beforeIdle = S_NEAREST;
+  static uint32_t quietSince = 0, lastSwitch = 0;
+  uint32_t now = millis();
+  if (screen == SCREEN_SETTINGS) return;
+  bool userActive = lastTouchMs && now - lastTouchMs < 60000UL;
+  bool idleClock = scr.clockShow == SHOW_IDLE, idleMetar = scr.metarShow == SHOW_IDLE;
+
+  bool any; double nk;
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+  any = nearest.valid; nk = nearest.distanceKm;
+  if (dataMutex) xSemaphoreGive(dataMutex);
+  bool quiet = lastDataMs && (!any || nk > scr.idleRange * KM_PER_UNIT);
+  if (!quiet || !(idleClock || idleMetar)) quietSince = 0; else if (!quietSince) quietSince = now;
+
+  if (idle) {
+    if (!quiet || userActive || !(idleClock || idleMetar)) {
+      idle = false; lastSwitch = now;
+      if (!userActive && (screen == S_CLOCK || screen == S_METAR)) screen = beforeIdle;
+      return;
+    }
+    if (idleClock && idleMetar && now - lastSwitch >= (scr.rotateSec > 20 ? scr.rotateSec : 20) * 1000UL) {
+      screen = screen == S_CLOCK ? S_METAR : S_CLOCK; lastSwitch = now;
+    }
+    return;
+  }
+  // A page that was switched off (or an idle-only page after a tap): back to the first page
+  if (!pageEnabled(screen) && !userActive) { screen = S_NEAREST; lastSwitch = now; }
+
+  if (quietSince && now - quietSince > 30000UL && !userActive) {
+    idle = true; beforeIdle = screen; lastSwitch = now;
+    screen = idleClock ? S_CLOCK : S_METAR;
+    return;
+  }
+  if (scr.rotate && !userActive && now - lastSwitch >= (uint32_t)scr.rotateSec * 1000UL) {
+    screen = nextPage(screen, 1); lastSwitch = now;
+  }
 }
 
 void loop() {
@@ -3483,9 +4259,11 @@ void loop() {
   if (!bootOk && millis() > 60000) { bootOk = true; if (prefs.getUChar("bootfail", 0)) prefs.putUChar("bootfail", 0); }
 
   checkTouch();
+  autoScreens();
   themeUpdate();
   nightUpdate();
   render();
+  updateBanner();
   updateNavOverlay();
   ledUpdate();
   delay(33);
