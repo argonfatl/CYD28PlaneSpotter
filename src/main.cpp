@@ -158,6 +158,21 @@ struct LedConfig {                 // protected by configMutex, persisted in NVS
   char watch[96] = "";             // comma-separated type codes / callsign prefixes
 } ledCfg;
 
+// Phone notifications through ntfy (https://ntfy.sh): protected by configMutex, persisted in NVS
+enum { NT_WATCH = 1, NT_MIL = 2, NT_INTR = 4, NT_HELI = 8, NT_LOW = 16 };
+struct NotifyConfig {
+  bool on = false;
+  char server[64] = "https://ntfy.sh";
+  char topic[65] = "";
+  float range = 5;                 // display units
+  uint8_t cats = NT_WATCH | NT_MIL | NT_INTR | NT_HELI;
+  int lowAltFt = 1000;             // for NT_LOW
+  uint8_t coolH = 6;               // the same aircraft again only after this many hours
+  bool quietNight = true;          // nothing while night mode is active
+} notifyCfg;
+volatile bool notifyTestRequested = false;
+char notifyStatus[64] = "";        // last result, for the web page
+
 enum AlertKind : uint8_t { ALERT_NONE, ALERT_LOWALT, ALERT_HELI, ALERT_INTERESTING, ALERT_MILITARY, ALERT_WATCH };
 struct AlertInfo {
   AlertKind kind = ALERT_NONE;
@@ -723,6 +738,33 @@ void logAircraft(const char* hexStr, const char* cs, const char* type, const cha
   n.kind = k; n.first = now; n.km = km; n.alt = alt;
 }
 
+// ---------------------------------------------------------------------------
+// Phone notifications: candidates are collected while parsing, sent after the poll
+// ---------------------------------------------------------------------------
+struct NotifyItem { char hex[8]; char cs[10]; char type[6]; char reg[10]; AlertKind kind; double km, brg; int alt; float kt; };
+NotifyItem notifyCand[4]; int notifyCandN = 0;   // fetch task only
+
+void notifyConsider(const NotifyConfig& nc, const WatchList& wl, const WatchList& noWatch, const char* hex,
+                    const char* cs, const char* type, const char* reg, const char* category, uint8_t dbFlags,
+                    int alt, float kt, double km, double brg) {
+  if (!hex[0] || km > nc.range * KM_PER_UNIT) return;
+  LedConfig t;
+  t.military = nc.cats & NT_MIL; t.interesting = nc.cats & NT_INTR; t.heli = nc.cats & NT_HELI;
+  t.lowAltFt = (nc.cats & NT_LOW) ? nc.lowAltFt : 0;
+  AlertKind k = classifyAlert(t, (nc.cats & NT_WATCH) ? wl : noWatch, cs, type, category, dbFlags, alt);
+  if (k == ALERT_NONE) return;
+  int slot = notifyCandN < 4 ? notifyCandN++ : -1;
+  if (slot < 0) {                        // full: replace the farthest if this one is nearer
+    double far = km;
+    for (int i = 0; i < 4; i++) if (notifyCand[i].km > far) { far = notifyCand[i].km; slot = i; }
+    if (slot < 0) return;
+  }
+  NotifyItem& n = notifyCand[slot];
+  copyAscii(n.hex, hex, sizeof(n.hex)); copyAscii(n.cs, cs[0] ? cs : "?", sizeof(n.cs));
+  copyAscii(n.type, type, sizeof(n.type)); copyAscii(n.reg, reg, sizeof(n.reg));
+  n.kind = k; n.km = km; n.brg = brg; n.alt = alt; n.kt = kt;
+}
+
 // Fetches aircraft data into caller-provided local buffers (thread-safe — no globals touched)
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                      Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut,
@@ -773,6 +815,13 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   blipCntOut = 0;
   top5CntOut = 0;
 
+  NotifyConfig nc;
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  nc = notifyCfg;
+  if (configMutex) xSemaphoreGive(configMutex);
+  WatchList noWatch;
+  notifyCandN = 0;
+
   bool logging = logMutex && logBegin();
   if (logging) xSemaphoreTake(logMutex, portMAX_DELAY);
   for (JsonObject s : acList) {
@@ -796,6 +845,8 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     uint8_t dbFlags = s["dbFlags"] | 0;
     count++;
     if (logging) logAircraft(s["hex"] | "", cs, type, category, dbFlags, altFt, gsKt, d, wl);
+    if (nc.on && nc.topic[0])
+      notifyConsider(nc, wl, noWatch, s["hex"] | "", cs, type, s["r"] | "", category, dbFlags, altFt, gsKt, d, brg);
 
     // LED alerts: keep the highest-priority (then nearest) special aircraft in range
     if (lc.alerts && d <= alertKm) {
@@ -950,6 +1001,84 @@ void runGithubUpdate() {
   otaActive = false; lastScreen = 255;
 }
 
+String withCommas(int v);
+bool nightNow();
+
+// POST one message to <server>/<topic>. Returns the HTTP status (200 = sent).
+int ntfySend(const NotifyConfig& nc, const char* title, const String& body, const char* tags,
+             const String& click, int priority) {
+  String url = String(nc.server) + "/" + nc.topic;
+  WiFiClientSecure sc; sc.setInsecure();
+  WiFiClient pc;
+  WiFiClient& cl = url.startsWith("https://") ? (WiFiClient&)sc : pc;
+  HTTPClient h;
+  h.setTimeout(10000);
+  h.setUserAgent("CYD28PlaneSpotter/1.2 (+https://github.com/argonfatl/CYD28PlaneSpotter)");
+  if (!h.begin(cl, url)) { snprintf(notifyStatus, sizeof(notifyStatus), "Error: bad server address"); return -1; }
+  h.addHeader("Title", title);
+  h.addHeader("Tags", tags);
+  h.addHeader("Priority", String(priority));
+  if (click.length()) h.addHeader("Click", click);
+  int code = h.POST(body);
+  h.end();
+  if (code != HTTP_CODE_OK) {
+    if (code < 0) snprintf(notifyStatus, sizeof(notifyStatus), "Error: %s", h.errorToString(code).c_str());
+    else snprintf(notifyStatus, sizeof(notifyStatus), "Error: HTTP %d", code);
+    Serial.printf("ntfy: %s\n", notifyStatus);
+  }
+  return code;
+}
+
+// After each poll: send candidates not notified within the cooldown (at most 3 per poll)
+void processNotifications() {
+  NotifyConfig nc;
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  nc = notifyCfg;
+  if (configMutex) xSemaphoreGive(configMutex);
+
+  if (notifyTestRequested) {
+    notifyTestRequested = false;
+    if (!nc.topic[0]) snprintf(notifyStatus, sizeof(notifyStatus), "Error: no topic set");
+    else if (ntfySend(nc, "CYD Plane Spotter test", String("Notifications work. Location: ") + homeName,
+                      "airplane,white_check_mark", "", 3) == HTTP_CODE_OK)
+      snprintf(notifyStatus, sizeof(notifyStatus), "Test sent");
+  }
+  if (!nc.on || !nc.topic[0] || notifyCandN == 0) return;
+  if (nc.quietNight && nightNow()) return;
+
+  struct Sent { char hex[8]; uint32_t ms; };
+  static Sent sent[32] = {};
+  uint32_t cool = (uint32_t)nc.coolH * 3600000UL, now = millis();
+  int done = 0;
+  for (int i = 0; i < notifyCandN && done < 3; i++) {
+    NotifyItem& n = notifyCand[i];
+    int idx = -1, oldest = 0;
+    for (int j = 0; j < 32; j++) {
+      if (sent[j].hex[0] && strcmp(sent[j].hex, n.hex) == 0) { idx = j; break; }
+      if (now - sent[j].ms > now - sent[oldest].ms || !sent[j].hex[0]) oldest = j;
+    }
+    if (idx >= 0 && now - sent[idx].ms < cool) continue;
+
+    static const char* what[] = {"", "Low flying", "Helicopter", "Rare aircraft", "Military", "Watch list"};
+    static const char* tags[] = {"", "airplane,arrow_down", "helicopter", "airplane,star", "airplane,warning", "airplane,eyes"};
+    char title[64];
+    if (n.type[0]) snprintf(title, sizeof(title), "%s nearby: %s (%s)", what[n.kind], n.cs, n.type);
+    else snprintf(title, sizeof(title), "%s nearby: %s", what[n.kind], n.cs);
+    char body[128];
+    snprintf(body, sizeof(body), "%.1f %s %s, %s ft, %d kt%s%s", n.km / KM_PER_UNIT, DIST_UNIT, compass(n.brg),
+             withCommas(n.alt).c_str(), (int)lroundf(n.kt), n.reg[0] ? ", reg " : "", n.reg);
+    String click = String("https://globe.airplanes.live/?icao=") + n.hex;
+    if (ntfySend(nc, title, body, tags[n.kind], click, n.kind == ALERT_WATCH ? 4 : 3) == HTTP_CODE_OK) {
+      Sent& e = sent[idx >= 0 ? idx : oldest];
+      strcpy(e.hex, n.hex); e.ms = now;
+      time_t t = time(nullptr); struct tm lt; localtime_r(&t, &lt);
+      snprintf(notifyStatus, sizeof(notifyStatus), "Sent %s at %02d:%02d", n.cs, lt.tm_hour, lt.tm_min);
+      Serial.printf("ntfy: %s - %s\n", title, body);
+    }
+    done++;
+  }
+}
+
 // ===================================================================
 // Background Data Fetcher — runs on Core 0 so Core 1 stays smooth
 // ===================================================================
@@ -1017,12 +1146,16 @@ void dataFetcherTask(void* param) {
         stats.lastUpdateMs = lastDataMs;
         xSemaphoreGive(dataMutex);
 
+        processNotifications();
+      } else if (notifyTestRequested) {
+        notifyCandN = 0;
+        processNotifications();
       }
     }
 
     // Wait for the next poll interval; a location change or button press cuts it short
     for (int t = 0; t < UPDATE_INTERVAL_MS / 250; t++) {
-      if (refreshRequested || ipLocateRequested || ghCheckRequested || ghUpdateRequested) {
+      if (refreshRequested || ipLocateRequested || ghCheckRequested || ghUpdateRequested || notifyTestRequested) {
         if (refreshRequested) weatherDone = false;  // new location -> new weather too
         break;
       }
@@ -2538,6 +2671,10 @@ void initWebServer() {
     lc = ledCfg;
     if (configMutex) xSemaphoreGive(configMutex);
     auto chk = [](bool b) { return b ? String(" checked") : String(""); };
+    NotifyConfig nc;
+    if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+    nc = notifyCfg;
+    if (configMutex) xSemaphoreGive(configMutex);
     auto hhmm = [](uint16_t m) { char b[8]; snprintf(b, sizeof(b), "%02u:%02u", (m / 60) % 24, m % 60); return String(b); };
     auto sel = [](bool b) { return b ? String(" selected") : String(""); };
     String rollback = previousFirmware()
@@ -2626,6 +2763,37 @@ void initWebServer() {
   <div style="display:flex;justify-content:space-between;color:#777;font-size:0.7em"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>
   <div id="tdr" style="font-size:0.9em;margin-top:10px"></div>
   <div id="tdn" style="font-size:0.9em;margin-top:10px"></div>
+</div>
+<div class="card">
+  <h2>Phone notifications</h2>
+  <div class="hint">Install the <b>ntfy</b> app (iPhone / Android) and subscribe to the topic below. No account needed; anyone who knows the topic name can read it, so keep it random.</div>
+  <label class="chk"><input type="checkbox" id="non")rawliteral" + chk(nc.on) + R"rawliteral(> Send notifications</label>
+  <label>Topic</label>
+  <div class="row"><input id="ntp" maxlength="64" value=")rawliteral" + String(nc.topic) + R"rawliteral(" placeholder="e.g. planes-7k3x9q"><button type="button" onclick="rndTopic()">Random</button></div>
+  <div class="hint" id="nlink"></div>
+  <label>Server</label>
+  <input id="nsv" maxlength="63" value=")rawliteral" + String(nc.server) + R"rawliteral(">
+  <label>Within ()rawliteral" + String(DIST_UNIT) + R"rawliteral()</label>
+  <input type="number" step="0.5" min="0.5" max="100" id="nrg" value=")rawliteral" + String(nc.range, 1) + R"rawliteral(">
+  <div class="sub">
+    <label class="chk"><input type="checkbox" id="nc1")rawliteral" + chk(nc.cats & NT_WATCH) + R"rawliteral(> Watch list (from the Back LED card)</label>
+    <label class="chk"><input type="checkbox" id="nc2")rawliteral" + chk(nc.cats & NT_MIL) + R"rawliteral(> Military</label>
+    <label class="chk"><input type="checkbox" id="nc4")rawliteral" + chk(nc.cats & NT_INTR) + R"rawliteral(> Government / rare aircraft</label>
+    <label class="chk"><input type="checkbox" id="nc8")rawliteral" + chk(nc.cats & NT_HELI) + R"rawliteral(> Helicopters</label>
+    <label class="chk"><input type="checkbox" id="nc16")rawliteral" + chk(nc.cats & NT_LOW) + R"rawliteral(> Lower than <input type="number" step="100" min="100" max="20000" id="nlo" value=")rawliteral" + String(nc.lowAltFt) + R"rawliteral(" style="width:90px;padding:4px;margin:0 4px"> ft</label>
+  </div>
+  <label>Same aircraft again after</label>
+  <select id="ncl" style="width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em">
+    <option value="1")rawliteral" + sel(nc.coolH == 1) + R"rawliteral(>1 hour</option>
+    <option value="3")rawliteral" + sel(nc.coolH == 3) + R"rawliteral(>3 hours</option>
+    <option value="6")rawliteral" + sel(nc.coolH == 6) + R"rawliteral(>6 hours</option>
+    <option value="12")rawliteral" + sel(nc.coolH == 12) + R"rawliteral(>12 hours</option>
+    <option value="24")rawliteral" + sel(nc.coolH == 24) + R"rawliteral(>24 hours</option>
+  </select>
+  <label class="chk"><input type="checkbox" id="nqt")rawliteral" + chk(nc.quietNight) + R"rawliteral(> Quiet during night mode</label>
+  <div class="hint" id="nst">)rawliteral" + String(notifyStatus) + R"rawliteral(</div>
+  <button type="button" onclick="saveNotify()">Save notifications</button>
+  <button type="button" class="opt" style="text-align:center" onclick="testNotify()">Send test notification</button>
 </div>
 <div class="card">
   <h2>Night mode</h2>
@@ -2738,6 +2906,25 @@ function ghInstall(){
   post('/update-github','',function(x){if(x.status!=200){flash(x.responseText);return}ghBusy=true;setTimeout(ghPoll,1000)});
 }
 ghPoll();
+function nLink(){
+  var t=$('ntp').value.trim(),s=$('nsv').value.trim().replace(/\/$/,''),h=s.replace(/^https?:\/\//,'');
+  $('nlink').innerHTML=t?'On your phone: <a style="color:#00c8ff" href="ntfy://'+h+'/'+encodeURIComponent(t)+'">open in the ntfy app</a> or <a style="color:#00c8ff" href="'+s+'/'+encodeURIComponent(t)+'" target="_blank">in the browser</a>':'';
+}
+$('ntp').addEventListener('input',nLink);$('nsv').addEventListener('input',nLink);nLink();
+function rndTopic(){var c='abcdefghijkmnpqrstuvwxyz23456789',t='planes-';for(var i=0;i<10;i++)t+=c[Math.floor(Math.random()*c.length)];$('ntp').value=t;nLink()}
+function nBody(){
+  var c=0;[1,2,4,8,16].forEach(function(b){if($('nc'+b).checked)c|=b});
+  return 'on='+($('non').checked?1:0)+'&topic='+encodeURIComponent($('ntp').value.trim())+'&server='+encodeURIComponent($('nsv').value.trim())+
+    '&range='+encodeURIComponent($('nrg').value)+'&cats='+c+'&low='+encodeURIComponent($('nlo').value)+'&cool='+$('ncl').value+'&quiet='+($('nqt').checked?1:0);
+}
+function saveNotify(){post('/notify',nBody(),function(x){flash(x.status==200?'✓ Notifications saved!':x.responseText)})}
+function testNotify(){
+  post('/notify',nBody(),function(x){
+    if(x.status!=200){flash(x.responseText);return}
+    $('nst').textContent='Sending...';
+    post('/notify-test','',function(){setTimeout(function(){fetch('/notify-status').then(function(r){return r.text()}).then(function(t){$('nst').textContent=t})},4000)});
+  });
+}
 function saveNight(){
   var t=function(i){var v=$(i).value.split(':');return (+v[0])*60+(+v[1]||0)};
   post('/night','m='+$('nm').value+'&f='+t('nf')+'&t='+t('nt')+'&l='+$('nl').value+'&led='+($('nled').checked?1:0),
@@ -2904,6 +3091,53 @@ function forget(){
     ghMsg[0] = '\0'; ghPct = 0; ghState = GH_DOWNLOADING; ghUpdateRequested = true;
     server.send(200, "text/plain", "OK");
   });
+
+  // POST /notify — phone notification settings
+  server.on("/notify", HTTP_POST, []() {
+    NotifyConfig n;
+    n.on = server.arg("on") == "1";
+    String topic = server.arg("topic"), srv = server.arg("server");
+    topic.trim(); srv.trim();
+    while (srv.endsWith("/")) srv.remove(srv.length() - 1);
+    for (unsigned i = 0; i < topic.length(); i++) {
+      char c = topic[i];
+      if (!isalnum((uint8_t)c) && c != '-' && c != '_') { server.send(400, "text/plain", "Topic: letters, digits, - and _ only"); return; }
+    }
+    if (topic.length() > 64) { server.send(400, "text/plain", "Topic is too long"); return; }
+    if (n.on && topic.isEmpty()) { server.send(400, "text/plain", "Enter a topic first"); return; }
+    if (!(srv.startsWith("https://") || srv.startsWith("http://")) || srv.length() > 63) {
+      server.send(400, "text/plain", "Server must start with https://"); return;
+    }
+    n.range = server.arg("range").toFloat();
+    n.cats = server.arg("cats").toInt() & 31;
+    n.lowAltFt = server.arg("low").toInt();
+    int cool = server.arg("cool").toInt();
+    n.quietNight = server.arg("quiet") == "1";
+    if (n.range < 0.5f || n.range > 100 || n.lowAltFt < 100 || n.lowAltFt > 20000 || cool < 1 || cool > 24) {
+      server.send(400, "text/plain", "Invalid values"); return;
+    }
+    n.coolH = cool;
+    copyAscii(n.topic, topic.c_str(), sizeof(n.topic));
+    copyAscii(n.server, srv.c_str(), sizeof(n.server));
+    if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+    notifyCfg = n;
+    prefs.putBool("ntf_on", n.on);
+    prefs.putString("ntf_topic", n.topic);
+    prefs.putString("ntf_srv", n.server);
+    prefs.putFloat("ntf_range", n.range);
+    prefs.putUChar("ntf_cats", n.cats);
+    prefs.putInt("ntf_low", n.lowAltFt);
+    prefs.putUChar("ntf_cool", n.coolH);
+    prefs.putBool("ntf_quiet", n.quietNight);
+    if (configMutex) xSemaphoreGive(configMutex);
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/notify-test", HTTP_POST, []() {
+    snprintf(notifyStatus, sizeof(notifyStatus), "Sending...");
+    notifyTestRequested = true;
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/notify-status", HTTP_GET, []() { server.send(200, "text/plain", notifyStatus); });
 
   // POST /night — night mode settings
   server.on("/night", HTTP_POST, []() {
@@ -3087,6 +3321,14 @@ void setup() {
   if (prefs.isKey("led_watch")) copyAscii(ledCfg.watch, prefs.getString("led_watch").c_str(), sizeof(ledCfg.watch));
   PREF("bl", getUChar, backlightPct);
   PREF("navbtn", getBool, navButtons);
+  PREF("ntf_on", getBool, notifyCfg.on);
+  if (prefs.isKey("ntf_topic")) copyAscii(notifyCfg.topic, prefs.getString("ntf_topic").c_str(), sizeof(notifyCfg.topic));
+  if (prefs.isKey("ntf_srv")) copyAscii(notifyCfg.server, prefs.getString("ntf_srv").c_str(), sizeof(notifyCfg.server));
+  PREF("ntf_range", getFloat, notifyCfg.range);
+  PREF("ntf_cats", getUChar, notifyCfg.cats);
+  PREF("ntf_low", getInt, notifyCfg.lowAltFt);
+  PREF("ntf_cool", getUChar, notifyCfg.coolH);
+  PREF("ntf_quiet", getBool, notifyCfg.quietNight);
   PREF("night_mode", getUChar, nightCfg.mode);
   PREF("night_from", getUShort, nightCfg.fromMin);
   PREF("night_to", getUShort, nightCfg.toMin);
