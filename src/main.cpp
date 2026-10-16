@@ -1173,7 +1173,7 @@ bool fetchMetarTo(Metar& m, char* err, size_t errLen) {
   m.wdir = best["wdir"].is<int>() ? best["wdir"].as<int>() : -1;     // -1 = variable
   m.wspd = best["wspd"] | 0; m.wgst = best["wgst"] | 0;
   if (best["visib"].is<const char*>()) copyAscii(m.visib, best["visib"], sizeof(m.visib));
-  else snprintf(m.visib, sizeof(m.visib), "%g", best["visib"] | 0.0);
+  else { char vb[24]; snprintf(vb, sizeof(vb), "%g", best["visib"] | 0.0); copyAscii(m.visib, vb, sizeof(m.visib)); }
   // Ceiling: lowest broken or overcast layer
   m.ceiling[0] = '\0';
   for (JsonObject c : best["clouds"].as<JsonArray>()) {
