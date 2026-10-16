@@ -2538,7 +2538,7 @@ void initWebServer() {
     lc = ledCfg;
     if (configMutex) xSemaphoreGive(configMutex);
     auto chk = [](bool b) { return b ? String(" checked") : String(""); };
-    auto hhmm = [](uint16_t m) { char b[6]; snprintf(b, sizeof(b), "%02u:%02u", m / 60, m % 60); return String(b); };
+    auto hhmm = [](uint16_t m) { char b[8]; snprintf(b, sizeof(b), "%02u:%02u", (m / 60) % 24, m % 60); return String(b); };
     auto sel = [](bool b) { return b ? String(" selected") : String(""); };
     String rollback = previousFirmware()
         ? String("<button type=\"button\" class=\"opt\" style=\"text-align:center\" onclick=\"rollback()\">Switch back to ") +
