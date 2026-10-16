@@ -1214,56 +1214,61 @@ void screenTargetIntel(bool newPage) {
 }
 
 void screenTop5(bool newPage) {
-  drawHeader("TOP 5 IN RANGE", newPage);
+  drawHeader("TRAFFIC NEAR YOU", newPage);
+  tft.setTextPadding(0);
+  tft.setTextDatum(TL_DATUM);
+
+  const int x0 = 7, rowW = 306, rowH = 31, gap = 4, firstY = 65;
+  tft.setTextFont(1);
+  tft.setTextColor(C_SOFT, C_BG);
+  tft.drawString("FLIGHT", 16, 43);
+  tft.drawString("ROUTE", 111, 43);
+  tft.drawRightString("ALTITUDE / RANGE", 304, 43, 1);
+  tft.drawFastHLine(10, 58, 300, C_EDGE);
 
   if (top5Count == 0) {
-    tft.setTextFont(4); tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.drawString("NO TARGETS", 100, 100);
+    card(10, 82, 300, 80);
+    tft.setTextFont(2); tft.setTextColor(TFT_WHITE, C_PANEL);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("No aircraft in range", 160, 111);
+    tft.setTextFont(1); tft.setTextColor(C_SOFT, C_PANEL);
+    tft.drawString("Traffic will appear here when detected", 160, 134);
+    tft.setTextDatum(TL_DATUM);
     return;
   }
 
-  if (newPage) {
-    tft.setTextFont(2); tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString("FLIGHT", 10, 40);
-    tft.drawString("ROUTE", 100, 40);
-    tft.drawString("ALTITUDE", 190, 40);
-    tft.drawLine(10, 60, 310, 60, TFT_DARKGREY);
-  }
-
-  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextPadding(80);
-
-  int y = 70;
-  for (int i=0; i<5; i++) {
-    if (i < top5Count) {
-      tft.drawString(top5[i].callsign, 10, y);
-
-      char rte[16];
-      if (top5[i].hasRoute) snprintf(rte, sizeof(rte), "%s->%s", top5[i].dep, top5[i].arr);
-      else strcpy(rte, "N/A");
-      tft.drawString(rte, 100, y);
-
-      char alt[32];
-      tft.setTextPadding(120);
-      snprintf(alt, sizeof(alt), "%d ft (FL%03d)", top5[i].altFt, (top5[i].altFt + 50) / 100);
-      tft.drawString(alt, 190, y);
-      tft.setTextPadding(80);
-
-    } else {
-      tft.drawString(" ", 10, y);
-      tft.drawString(" ", 100, y);
-      tft.setTextPadding(120);
-      tft.drawString(" ", 190, y);
-      tft.setTextPadding(80);
+  for (int i = 0; i < MAX_TOP5; i++) {
+    const int y = firstY + i * (rowH + gap);
+    if (i >= top5Count) {
+      tft.fillRect(x0, y, rowW, rowH, C_BG);
+      continue;
     }
-    y += 30;
+
+    card(x0, y, rowW, rowH);
+    tft.fillRoundRect(x0, y + 2, 3, rowH - 4, 2, i == 0 ? C_CYAN : C_EDGE);
+    tft.setTextFont(2);
+    tft.setTextColor(TFT_WHITE, C_PANEL);
+    tft.setTextPadding(78);
+    tft.drawString(fitPx(top5[i].callsign, 76), 17, y + 8);
+
+    char route[16];
+    if (top5[i].hasRoute) snprintf(route, sizeof(route), "%.4s>%.4s", top5[i].dep, top5[i].arr);
+    else strcpy(route, "—");
+    tft.setTextColor(C_CYAN, C_PANEL);
+    tft.setTextPadding(52);
+    tft.drawString(route, 111, y + 9);
+
+    char info[30];
+    if (top5[i].onGround) snprintf(info, sizeof(info), "GROUND  %.0f%s", toDisplayDist(top5[i].distanceKm), DIST_UNIT);
+    else snprintf(info, sizeof(info), "FL%03d  %.0f%s",
+                  (top5[i].altFt + 50) / 100, toDisplayDist(top5[i].distanceKm), DIST_UNIT);
+    tft.setTextColor(TFT_WHITE, C_PANEL);
+    tft.setTextPadding(0);
+    tft.drawRightString(info, 302, y + 9, 2);
   }
   tft.setTextPadding(0);
+  tft.setTextDatum(TL_DATUM);
 }
-
-// Range buttons on the radar page (drawn and hit-tested from the same constants)
-const int BTN_Y = 215, BTN_H = 20, BTN_W = 30;
-const int BTN_MINUS_X = 10, BTN_PLUS_X = 50;
 
 void screenRadar(bool newPage) {
   drawHeader("RADAR PPI", newPage);
@@ -1292,19 +1297,19 @@ void screenRadar(bool newPage) {
   const int cx = 100, cy = 100, R = 95;
   float elapsed = (millis() - lastDataMs) / 1000.0f;
 
-  radarSpr.fillSprite(TFT_BLACK);
-  radarSpr.drawCircle(cx, cy, R, TFT_DARKGREY);
-  radarSpr.drawCircle(cx, cy, R*2/3, TFT_DARKGREY);
-  radarSpr.drawCircle(cx, cy, R/3, TFT_DARKGREY);
-  radarSpr.drawLine(cx-R, cy, cx+R, cy, TFT_DARKGREY);
-  radarSpr.drawLine(cx, cy-R, cx, cy+R, TFT_DARKGREY);
+  radarSpr.fillSprite(C_BG);
+  radarSpr.drawCircle(cx, cy, R, C_EDGE);
+  radarSpr.drawCircle(cx, cy, R*2/3, C_EDGE);
+  radarSpr.drawCircle(cx, cy, R/3, C_EDGE);
+  radarSpr.drawLine(cx-R, cy, cx+R, cy, C_EDGE);
+  radarSpr.drawLine(cx, cy-R, cx, cy+R, C_EDGE);
 
   float sweepDeg = fmodf(millis() / 15.0f, 360.0f);
   double sw = deg2rad(sweepDeg);
-  radarSpr.drawLine(cx, cy, cx + (int)(sin(sw)*R), cy - (int)(cos(sw)*R), TFT_GREEN);
+  radarSpr.drawLine(cx, cy, cx + (int)(sin(sw)*R), cy - (int)(cos(sw)*R), C_CYAN);
 
   radarSpr.setTextFont(1);
-  radarSpr.setTextColor(TFT_WHITE, TFT_BLACK);
+  radarSpr.setTextColor(TFT_WHITE, C_BG);
 
   for (uint8_t i = 0; i < blipCount; i++) {
     double la = blips[i].lat, lo = blips[i].lon;
@@ -1322,8 +1327,8 @@ void screenRadar(bool newPage) {
     int by = cy - (int)(cos(deg2rad(brg)) * rr);
 
     float behind = fmodf(sweepDeg - (float)brg + 360.0f, 360.0f);
-    if (behind < 30) radarSpr.fillCircle(bx, by, 3, TFT_YELLOW);
-    else radarSpr.fillRect(bx, by, 2, 2, TFT_GREEN);
+    if (behind < 30) radarSpr.fillCircle(bx, by, 3, TFT_ORANGE);
+    else radarSpr.fillRect(bx, by, 2, 2, C_CYAN);
 
     // Callsign, flight level and speed in the smallest legible font
     if (blips[i].callsign[0]) {
@@ -1368,80 +1373,80 @@ void screenRadar(bool newPage) {
 
 // Unified Weather and System Screen
 void screenWeatherSystem(bool newPage) {
-  drawHeader("WEATHER & SYSTEM", newPage);
+  drawHeader("WEATHER & STATUS", newPage);
+  tft.setTextPadding(0);
+  tft.setTextDatum(TL_DATUM);
 
-  if (newPage) {
-    tft.drawLine(10, 115, 310, 115, TFT_DARKGREY);
-  }
-
-  // --- TOP HALF: WEATHER ---
+  // Weather summary panel
+  card(10, 38, 300, 70);
+  tft.setTextFont(1); tft.setTextColor(C_LABEL, C_PANEL);
+  tft.drawString("LOCAL CONDITIONS", 20, 45);
   if (!weather.valid) {
-    tft.setTextFont(4);
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.drawString("NO WX DATA", 20, 50);
+    tft.setTextFont(2); tft.setTextColor(TFT_WHITE, C_PANEL);
+    tft.drawString("Weather data unavailable", 20, 69);
   } else {
-    tft.setTextFont(4);
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.setTextPadding(130);
-    char buf[32]; snprintf(buf, sizeof(buf), "%.1f %s", weather.temp, TEMP_UNIT);
-    tft.drawString(buf, 20, 45);
-
-    tft.setTextFont(2);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.setTextPadding(150);
-    snprintf(buf, sizeof(buf), "Humidity: %d%%", weather.humidity);
-    tft.drawString(buf, 160, 45);
-    snprintf(buf, sizeof(buf), "Wind: %.0f %s", weather.wind, WIND_UNIT);
-    tft.drawString(buf, 160, 75);
+    char buf[40];
+    tft.setFreeFont(&FreeSansBold12pt7b);
+    tft.setTextColor(TFT_WHITE, C_PANEL);
+    snprintf(buf, sizeof(buf), "%.1f %s", weather.temp, TEMP_UNIT);
+    tft.drawString(buf, 20, 62);
+    tft.setTextFont(2); tft.setTextColor(C_CYAN, C_PANEL);
+    snprintf(buf, sizeof(buf), "HUM  %d%%", weather.humidity);
+    tft.drawString(buf, 180, 64);
+    snprintf(buf, sizeof(buf), "WIND  %.0f %s", weather.wind, WIND_UNIT);
+    tft.drawString(buf, 180, 84);
   }
 
-  // --- BOTTOM HALF: SYSTEM ---
-  tft.setTextFont(2);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextPadding(160);
+  tft.setTextFont(1); tft.setTextColor(C_LABEL, C_BG);
+  tft.drawString("DEVICE STATUS", 12, 115);
 
-  char bufSys[64];
+  // Two rows of compact status cards
+  card(10, 130, 146, 38);
+  card(164, 130, 146, 38);
+  card(10, 174, 146, 38);
+  card(164, 174, 146, 38);
+
+  char buf[56];
   uint32_t up = millis() / 1000;
-  snprintf(bufSys, sizeof(bufSys), "Uptime: %02lu:%02lu:%02lu",
+  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
            (unsigned long)(up / 3600), (unsigned long)((up % 3600) / 60), (unsigned long)(up % 60));
-  tft.drawString(bufSys, 20, 130);
+  tft.setTextFont(1); tft.setTextColor(C_LABEL, C_PANEL); tft.drawString("UPTIME", 18, 135);
+  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, C_PANEL); tft.drawString(buf, 18, 148);
 
-  snprintf(bufSys, sizeof(bufSys), "WiFi RSSI: %d dBm", WiFi.RSSI());
-  tft.drawString(bufSys, 180, 130);
+  tft.setTextFont(1); tft.setTextColor(C_LABEL, C_PANEL); tft.drawString("CONNECTION", 172, 135);
+  tft.setTextFont(2); tft.setTextColor(WiFi.status() == WL_CONNECTED ? C_CYAN : TFT_ORANGE, C_PANEL);
+  snprintf(buf, sizeof(buf), "%d dBm", WiFi.RSSI()); tft.drawString(buf, 172, 148);
 
-  // Free heap and the largest free block (a TLS connection needs a large one)
-  snprintf(bufSys, sizeof(bufSys), "RAM %uK  blk %uK", (unsigned)(ESP.getFreeHeap() / 1024),
+  tft.setTextFont(1); tft.setTextColor(C_LABEL, C_PANEL); tft.drawString("MEMORY / PEAK BLOCK", 18, 179);
+  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, C_PANEL);
+  snprintf(buf, sizeof(buf), "%uK / %uK", (unsigned)(ESP.getFreeHeap() / 1024),
            (unsigned)(ESP.getMaxAllocHeap() / 1024));
-  tft.drawString(bufSys, 20, 160);
+  tft.drawString(buf, 18, 192);
 
-  snprintf(bufSys, sizeof(bufSys), "Max seen: %u", stats.maxInView);
-  tft.drawString(bufSys, 180, 160);
-
-  tft.setTextPadding(300);
-  snprintf(bufSys, sizeof(bufSys), "API Req: %lu OK / %lu FAIL",
+  tft.setTextFont(1); tft.setTextColor(C_LABEL, C_PANEL); tft.drawString("AIRCRAFT REQUESTS", 172, 179);
+  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, C_PANEL);
+  snprintf(buf, sizeof(buf), "%lu OK  /  %lu ERR",
            (unsigned long)stats.requestsOk, (unsigned long)stats.requestsFail);
-  tft.drawString(bufSys, 20, 190);
+  tft.drawString(buf, 172, 192);
 
-  // Where and when aircraft data last arrived
+  // Freshness and last error remain visible below the metric grid.
   if (lastOkMs) {
     uint32_t ago = (millis() - lastOkMs) / 1000;
-    tft.setTextColor(ago < 60 ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
-    if (ago < 120) snprintf(bufSys, sizeof(bufSys), "Data: %s, %lus ago", SOURCES[activeSource].name, (unsigned long)ago);
-    else snprintf(bufSys, sizeof(bufSys), "Data: %s, %lum ago", SOURCES[activeSource].name, (unsigned long)(ago / 60));
+    tft.setTextColor(ago < 60 ? TFT_GREEN : TFT_YELLOW, C_BG);
+    if (ago < 120) snprintf(buf, sizeof(buf), "%s  ·  %lus ago", SOURCES[activeSource].name, (unsigned long)ago);
+    else snprintf(buf, sizeof(buf), "%s  ·  %lum ago", SOURCES[activeSource].name, (unsigned long)(ago / 60));
   } else {
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    snprintf(bufSys, sizeof(bufSys), "Data: none yet");
+    tft.setTextColor(TFT_YELLOW, C_BG);
+    snprintf(buf, sizeof(buf), "Waiting for first aircraft update");
   }
-  tft.drawString(bufSys, 20, 210);
+  tft.setTextFont(1); tft.drawString(buf, 12, 216);
 
-  // Last error (small font so the whole reason fits)
-  tft.setTextFont(1);
-  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-  char errLine[100];
-  snprintf(errLine, sizeof(errLine), "%s", lastFetchErr[0] ? lastFetchErr : " ");
-  tft.drawString(errLine, 20, 229);
-
+  if (lastFetchErr[0]) {
+    tft.setTextColor(TFT_ORANGE, C_BG);
+    tft.drawString(fitPx(lastFetchErr, 296), 12, 229);
+  }
   tft.setTextPadding(0);
+  tft.setTextDatum(TL_DATUM);
 }
 
 // Settings menu: status lines + 2x3 grid of big buttons
