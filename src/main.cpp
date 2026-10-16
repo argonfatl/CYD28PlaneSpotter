@@ -1178,27 +1178,71 @@ void fmtClock(char* buf, size_t n, bool withSecs) {
 }
 
 // ===========================================================================
-// UI — navy / cyan design system shared by all screens
+// UI — design system shared by all screens; colors come from the active theme
 // ===========================================================================
-#define C_BG     0x08A4   // #0A1520 background
-#define C_PANEL  0x08E5   // #0E1C2B card fill
-#define C_EDGE   0x19CA   // #1F3B57 card border
-#define C_CYAN   0x065F   // #00C8FF accent
-#define C_TRACK  0x21C9   // #26384A bars / unlit icon parts
-#define C_SOFT   0x8E1C   // #8FC3E6 secondary text
-#define C_LABEL  0x9D98   // #9DB2C6 labels
-#define C_BADGE  0x11CC   // #173B63 dark blue
-#define C_BLUEB  0x131C   // #1060E0 bright blue
-#define C_GREEN  0x2F0D   // #2EE06B aircraft / OK
-#define C_SUN    0xFE60   // #FFCC00 weather sun
-#define C_PILLOK 0x3F2B   // #3CE65A "connected" pill
-#define C_GOLD   0xF5C8   // #F0B840 (kept for older code paths)
+constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
+  return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
 
-// The radar sprite is 8-bit (RGB332): colors keep only their top bits, so radar
-// colors are picked to survive that conversion
-#define C_GRID8  0x2310   // dim steel blue rings
-#define C_RING8  0x0495   // teal outer ring / sweep tail
-#define C_DIM8   0x024A   // dark teal sweep tail
+struct Theme {
+  const char* name;
+  uint16_t bg, panel, edge, accent, track, soft, label, badge, blueb;
+  uint16_t aircraft, sun, pillOk, text, warn;
+  // The radar sprite is 8-bit (RGB332): these keep only their top bits,
+  // so they are picked to survive that conversion
+  uint16_t scope, grid8, ring8, dim8;
+};
+
+const Theme THEMES[] = {
+  // name           bg                panel             edge              accent            track
+  //                soft              label             badge             blueb
+  //                aircraft          sun               pillOk            text              warn
+  //                scope             grid8             ring8             dim8
+  {"Navy",        0x08A4,           0x08E5,           0x19CA,           0x065F,           0x21C9,
+                  0x8E1C,           0x9D98,           0x11CC,           0x131C,
+                  0x2F0D,           0xFE60,           0x3F2B,           0xFFFF,           TFT_ORANGE,
+                  TFT_BLACK,        0x2310,           0x0495,           0x024A},
+  {"Midnight",    rgb(0, 0, 0),     rgb(10, 14, 20),  rgb(38, 48, 64),  rgb(0, 200, 255), rgb(30, 38, 48),
+                  rgb(154, 176, 196), rgb(138, 152, 168), rgb(20, 36, 58), rgb(30, 90, 200),
+                  rgb(46, 224, 107), rgb(255, 204, 0), rgb(60, 230, 90), 0xFFFF,         TFT_ORANGE,
+                  TFT_BLACK,        rgb(32, 64, 96),  rgb(0, 144, 192), rgb(0, 64, 96)},
+  {"Radar Green", rgb(0, 8, 0),     rgb(0, 20, 0),    rgb(10, 74, 20),  rgb(51, 255, 102), rgb(10, 42, 16),
+                  rgb(127, 212, 143), rgb(95, 170, 111), rgb(10, 58, 24), rgb(20, 140, 50),
+                  rgb(204, 255, 102), rgb(224, 255, 128), rgb(51, 255, 102), rgb(200, 255, 208), rgb(255, 200, 0),
+                  rgb(0, 0, 0),     rgb(0, 64, 0),    rgb(0, 192, 64),  rgb(0, 96, 32)},
+  {"Amber",       rgb(10, 6, 0),    rgb(22, 12, 0),   rgb(74, 44, 0),   rgb(255, 176, 0), rgb(46, 28, 0),
+                  rgb(224, 160, 80), rgb(176, 128, 64), rgb(58, 34, 0),  rgb(160, 96, 0),
+                  rgb(255, 224, 128), rgb(255, 208, 64), rgb(255, 176, 0), rgb(255, 232, 192), rgb(255, 96, 32),
+                  rgb(0, 0, 0),     rgb(96, 64, 0),   rgb(192, 128, 0), rgb(96, 64, 0)},
+  {"Night Red",   rgb(0, 0, 0),     rgb(12, 0, 0),    rgb(64, 0, 0),    rgb(224, 32, 0),  rgb(32, 0, 0),
+                  rgb(160, 48, 32), rgb(128, 32, 24), rgb(48, 0, 0),    rgb(96, 0, 0),
+                  rgb(255, 64, 32), rgb(192, 48, 0),  rgb(192, 32, 0),  rgb(255, 80, 64), rgb(255, 128, 0),
+                  rgb(0, 0, 0),     rgb(64, 0, 0),    rgb(160, 0, 0),   rgb(96, 0, 0)},
+};
+const uint8_t NUM_THEMES = sizeof(THEMES) / sizeof(THEMES[0]);
+const uint8_t THEME_NIGHT_RED = 4;
+uint8_t themeIdx = 0;                 // chosen theme (NVS "theme")
+bool nightRedTheme = false;           // use Night Red while night mode is active (NVS "night_red")
+const Theme* th = &THEMES[0];         // active theme
+
+#define C_BG     (th->bg)        // background
+#define C_PANEL  (th->panel)     // card fill
+#define C_EDGE   (th->edge)      // card border
+#define C_CYAN   (th->accent)    // accent
+#define C_TRACK  (th->track)     // bars / unlit icon parts
+#define C_SOFT   (th->soft)      // secondary text
+#define C_LABEL  (th->label)     // labels
+#define C_BADGE  (th->badge)     // dark accent fill
+#define C_BLUEB  (th->blueb)     // bright accent fill (nav arrows)
+#define C_GREEN  (th->aircraft)  // aircraft / OK
+#define C_SUN    (th->sun)       // weather sun
+#define C_PILLOK (th->pillOk)    // "connected" pill
+#define C_TEXT   (th->text)      // primary text
+#define C_WARN   (th->warn)      // warnings, military, descent
+#define C_SCOPE  (th->scope)     // radar scope background
+#define C_GRID8  (th->grid8)     // radar rings
+#define C_RING8  (th->ring8)     // radar outer ring / sweep
+#define C_DIM8   (th->dim8)      // radar sweep tail
 
 // Currently selected aircraft (tap a row on the traffic page); falls back to nearest
 char selectedCs[10] = "";
@@ -1387,13 +1431,13 @@ void weatherIcon(int cx, int cy, int code) {
   bool sun = code <= 2, cloud = code >= 1;
   if (sun) iconSun(cloud ? cx - 7 : cx, cloud ? cy - 6 : cy, cloud ? 6 : 9, C_SUN);
   if (cloud) {
-    uint16_t cc = code >= 45 ? 0xBDF7 : TFT_WHITE;
+    uint16_t cc = code >= 45 ? 0xBDF7 : C_TEXT;
     tft.fillCircle(cx - 7, cy + 5, 7, cc); tft.fillCircle(cx + 3, cy, 9, cc); tft.fillCircle(cx + 12, cy + 6, 6, cc);
     tft.fillRect(cx - 7, cy + 5, 19, 8, cc);
     if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82))
       for (int k = -6; k <= 10; k += 8) tft.drawLine(cx + k, cy + 16, cx + k - 3, cy + 22, C_CYAN);
     if ((code >= 71 && code <= 77) || code == 85 || code == 86)
-      for (int k = -6; k <= 10; k += 8) tft.fillCircle(cx + k, cy + 19, 2, TFT_WHITE);
+      for (int k = -6; k <= 10; k += 8) tft.fillCircle(cx + k, cy + 19, 2, C_TEXT);
     if (code >= 95) tft.fillTriangle(cx + 2, cy + 13, cx - 3, cy + 22, cx + 5, cy + 19, C_SUN);
   }
 }
@@ -1419,7 +1463,7 @@ void drawHeader(const char* title, bool newPage) {
   char t[8]; fmtClock(t, sizeof(t), false);
   if (strcmp(t, lastClock) != 0) {
     strcpy(lastClock, t);
-    tft.setTextFont(2); tft.setTextDatum(TR_DATUM); tft.setTextColor(TFT_WHITE, C_BG);
+    tft.setTextFont(2); tft.setTextDatum(TR_DATUM); tft.setTextColor(C_TEXT, C_BG);
     tft.setTextPadding(44);
     tft.drawString(t, 282, 5);
     tft.setTextPadding(0); tft.setTextDatum(TL_DATUM);
@@ -1428,7 +1472,7 @@ void drawHeader(const char* title, bool newPage) {
   if (bars != lastBars) {
     lastBars = bars;
     tft.fillRect(287, 2, 32, 22, C_BG);
-    iconWifi(303, 19, bars, screen == SCREEN_SETTINGS ? TFT_ORANGE : C_CYAN, C_TRACK, C_BG);
+    iconWifi(303, 19, bars, screen == SCREEN_SETTINGS ? C_WARN : C_CYAN, C_TRACK, C_BG);
   }
 }
 
@@ -1477,12 +1521,12 @@ void screenTargetIntel(bool newPage) {
 
   // --- Identity card ---
   card(4, 29, 312, 52);
-  tft.setFreeFont(&FreeSansBold18pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.setFreeFont(&FreeSansBold18pt7b); tft.setTextColor(C_TEXT, C_PANEL);
   tft.drawString(fitPx(a.callsign, 196), 12, 31);
   tft.setFreeFont(&FreeSans9pt7b); tft.setTextColor(C_SOFT, C_PANEL);
   tft.drawString(fitPx(a.airline[0] ? a.airline : (a.model[0] ? a.model : "Unknown operator"), 200), 12, 62);
   bool mil = a.dbFlags & 1, heli = strcmp(a.category, "A7") == 0;
-  drawPlaneGlyph(240, 51, 15, -90, mil ? TFT_ORANGE : C_CYAN);
+  drawPlaneGlyph(240, 51, 15, -90, mil ? C_WARN : C_CYAN);
   tft.setTextFont(2); tft.setTextColor(C_SOFT, C_PANEL); tft.setTextDatum(TR_DATUM);
   tft.drawString(mil ? "MIL" : heli ? "HELI" : (a.type[0] ? a.type : ""), 306, 58);
   tft.setTextDatum(TL_DATUM);
@@ -1490,7 +1534,7 @@ void screenTargetIntel(bool newPage) {
   // --- Route card: the line doubles as a progress bar, the plane sits where it is ---
   card(4, 85, 312, 44);
   if (a.hasRoute) {
-    tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+    tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(C_TEXT, C_PANEL);
     tft.drawString(a.dep, 12, 88);
     int wDep = tft.textWidth(a.dep);
     tft.setTextDatum(TR_DATUM); tft.drawString(a.arr, 308, 88);
@@ -1525,13 +1569,13 @@ void screenTargetIntel(bool newPage) {
   label(a.altFt >= 18000 ? "ALTITUDE" : "ALTITUDE FT", 12, R1 + 6);
   label("SPEED", 116, R1 + 6);
   label("HEADING", 220, R1 + 6);
-  tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(C_TEXT, C_PANEL);
   tft.drawString(altText(a.altFt, false), 12, R1 + 18);
   snprintf(buf, sizeof(buf), "%d KT", (int)lround(a.gsKt));
   tft.drawString(buf, 116, R1 + 18);
   snprintf(buf, sizeof(buf), "%03d", ((int)lround(a.trackDeg)) % 360);
   tft.drawString(buf, 220, R1 + 18);
-  degree(220 + tft.textWidth(buf) + 4, R1 + 21, 3, TFT_WHITE);
+  degree(220 + tft.textWidth(buf) + 4, R1 + 21, 3, C_TEXT);
   iconCompass(296, R1 + 26, a.trackDeg, C_CYAN);
 
   // --- Distance / position / climb ---
@@ -1540,23 +1584,23 @@ void screenTargetIntel(bool newPage) {
   label("DISTANCE", 12, R2 + 6);
   label("POSITION", 116, R2 + 6);
   label(a.vrateFpm >= 300 ? "CLIMB" : a.vrateFpm <= -300 ? "DESCENT" : "LEVEL", 254, R2 + 6);
-  tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(C_TEXT, C_PANEL);
   snprintf(buf, sizeof(buf), "%.1f %s", toDisplayDist(a.distanceKm), DIST_UNIT);
   tft.drawString(fitPx(buf, 86), 12, R2 + 22);
-  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.setTextFont(2); tft.setTextColor(C_TEXT, C_PANEL);
   for (int k = 0; k < 2; k++) {
     double v = k == 0 ? a.lat : a.lon;
     snprintf(buf, sizeof(buf), "%.2f", fabs(v));
     int y = R2 + 18 + k * 18;
     tft.drawString(buf, 116, y);
     int w = tft.textWidth(buf);
-    degree(116 + w + 3, y + 3, 2, TFT_WHITE);
+    degree(116 + w + 3, y + 3, 2, C_TEXT);
     tft.drawString(k == 0 ? (v >= 0 ? "N" : "S") : (v >= 0 ? "E" : "W"), 116 + w + 8, y);
   }
   bool up = a.vrateFpm >= 300, down = a.vrateFpm <= -300;
-  drawPlaneGlyph(274, R2 + 32, 11, up ? -35 : down ? 35 : 0, up ? C_GREEN : down ? TFT_ORANGE : C_SOFT);
+  drawPlaneGlyph(274, R2 + 32, 11, up ? -35 : down ? 35 : 0, up ? C_GREEN : down ? C_WARN : C_SOFT);
   if (up || down) {
-    arrowUpDown(304, R2 + 26, 4, up, up ? C_GREEN : TFT_ORANGE);
+    arrowUpDown(304, R2 + 26, 4, up, up ? C_GREEN : C_WARN);
     tft.setTextFont(1); tft.setTextColor(C_SOFT, C_PANEL);
     snprintf(buf, sizeof(buf), "%s fpm", withCommas(abs(a.vrateFpm)).c_str());
     tft.drawString(buf, 254, R2 + 45);
@@ -1583,7 +1627,7 @@ void screenTop5(bool newPage) {
 
   if (top5Count == 0) {
     card(10, 82, 300, 80);
-    tft.setFreeFont(&FreeSans9pt7b); tft.setTextColor(TFT_WHITE, C_PANEL); tft.setTextDatum(MC_DATUM);
+    tft.setFreeFont(&FreeSans9pt7b); tft.setTextColor(C_TEXT, C_PANEL); tft.setTextDatum(MC_DATUM);
     tft.drawString("No aircraft in range", 160, 112);
     tft.setTextFont(1); tft.setTextColor(C_SOFT, C_PANEL);
     tft.drawString("Traffic will appear here when detected", 160, 138);
@@ -1599,9 +1643,9 @@ void screenTop5(bool newPage) {
     card(4, y, 312, TR_H);
     if (isTarget) { tft.drawRoundRect(4, y, 312, TR_H, 6, C_CYAN); tft.drawRoundRect(5, y + 1, 310, TR_H - 2, 5, C_CYAN); }
     bool mil = a.dbFlags & 1;
-    drawPlaneGlyph(22, y + 19, 9, -90, mil ? TFT_ORANGE : isTarget ? C_CYAN : C_GREEN);
+    drawPlaneGlyph(22, y + 19, 9, -90, mil ? C_WARN : isTarget ? C_CYAN : C_GREEN);
 
-    tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+    tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(C_TEXT, C_PANEL);
     tft.drawString(fitPx(a.callsign, 130), 40, y + 3);
     tft.drawString(altText(a.altFt, true), 184, y + 3);
 
@@ -1635,7 +1679,7 @@ void drawRangeButtons(float current) {
     tft.drawRoundRect(RB_X, y, RB_W, RB_H, 6, on ? C_CYAN : C_EDGE);
     if (on) tft.drawRoundRect(RB_X + 1, y + 1, RB_W - 2, RB_H - 2, 5, C_CYAN);
     tft.setTextDatum(MC_DATUM);
-    tft.setTextFont(2); tft.setTextColor(TFT_WHITE, on ? C_BADGE : C_PANEL);
+    tft.setTextFont(2); tft.setTextColor(C_TEXT, on ? C_BADGE : C_PANEL);
     tft.drawString(String(RANGE_PRESETS[k]), RB_X + RB_W / 2, y + 17);
     tft.setTextFont(1); tft.setTextColor(C_SOFT, on ? C_BADGE : C_PANEL);
     tft.drawString(DIST_UNIT, RB_X + RB_W / 2, y + 33);
@@ -1657,7 +1701,7 @@ void screenRadar(bool newPage) {
   static float drawnRange = -1; static int drawnTracks = -1;
   if (newPage) {
     tft.fillRect(0, 26, 320, 214, C_BG);
-    tft.fillRoundRect(SCOPE_X - 2, SCOPE_Y - 2, SCOPE + 4, SCOPE + 4, 8, TFT_BLACK);   // scope bezel
+    tft.fillRoundRect(SCOPE_X - 2, SCOPE_Y - 2, SCOPE + 4, SCOPE + 4, 8, C_SCOPE);   // scope bezel
     tft.drawRoundRect(SCOPE_X - 2, SCOPE_Y - 2, SCOPE + 4, SCOPE + 4, 8, C_EDGE);
     card(236, 30, 80, 156);
     label("RANGE", 243, 37); label("TRACKS", 243, 73);
@@ -1677,19 +1721,19 @@ void screenRadar(bool newPage) {
     drawnRange = rRange;
     drawRangeButtons(rRange);
     tft.fillRect(242, 47, 70, 18, C_PANEL);
-    tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+    tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(C_TEXT, C_PANEL);
     tft.drawString(String((int)lroundf(rRange)) + " " + DIST_UNIT, 243, 47);
   }
   if (stats.inView != drawnTracks) {
     drawnTracks = stats.inView;
     tft.fillRect(242, 83, 70, 18, C_PANEL);
-    tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+    tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(C_TEXT, C_PANEL);
     tft.drawString(String(stats.inView), 243, 83);
   }
 
   // Scope (sprite, every frame)
   const int cx = SCOPE / 2, cy = SCOPE / 2, R = 80;
-  radarSpr.fillSprite(TFT_BLACK);
+  radarSpr.fillSprite(C_SCOPE);
   for (int a = 0; a < 360; a += 6) {                       // dashed inner rings
     float t = a * PI / 180.0f;
     for (int ring = 1; ring <= 2; ring++) {
@@ -1713,7 +1757,7 @@ void screenRadar(bool newPage) {
     radarSpr.drawLine(cx + lroundf(cosf(t) * (R - 4)), cy + lroundf(sinf(t) * (R - 4)),
                       cx + lroundf(cosf(t) * R), cy + lroundf(sinf(t) * R), C_RING8);
   }
-  radarSpr.setTextFont(1); radarSpr.setTextColor(TFT_WHITE, TFT_BLACK); radarSpr.setTextDatum(MC_DATUM);
+  radarSpr.setTextFont(1); radarSpr.setTextColor(C_TEXT, C_SCOPE); radarSpr.setTextDatum(MC_DATUM);
   radarSpr.drawString("N", cx, cy - R - 6); radarSpr.drawString("S", cx, cy + R + 6);
   radarSpr.drawString("W", cx - R - 6, cy); radarSpr.drawString("E", cx + R + 6, cy);
   radarSpr.setTextDatum(TL_DATUM);
@@ -1735,7 +1779,7 @@ void screenRadar(bool newPage) {
     if (isTarget) {
       radarSpr.drawCircle(bx, by, 11, C_CYAN);
       drawPlaneGlyph(radarSpr, bx, by, 8, blips[i].track - 90, C_CYAN);
-      radarSpr.setTextColor(C_CYAN, TFT_BLACK);
+      radarSpr.setTextColor(C_CYAN, C_SCOPE);
       int lx = bx + 13; if (lx + 50 > SCOPE) lx = bx - 63;
       radarSpr.drawString(blips[i].callsign, lx, by - 4);
     } else {
@@ -1787,16 +1831,16 @@ void screenWeatherSystem(bool newPage) {
       tft.drawString("Weather unavailable", 14, 72);
     } else {
       weatherIcon(34, 76, weather.code);
-      tft.setFreeFont(&FreeSansBold18pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+      tft.setFreeFont(&FreeSansBold18pt7b); tft.setTextColor(C_TEXT, C_PANEL);
       snprintf(buf, sizeof(buf), "%d", (int)lroundf(weather.temp));
       tft.drawString(buf, 66, 50);
       int w = tft.textWidth(buf);
-      degree(66 + w + 5, 55, 4, TFT_WHITE);
+      degree(66 + w + 5, 55, 4, C_TEXT);
       tft.drawString(TEMP_UNIT, 66 + w + 12, 50);
       tft.setTextFont(2); tft.setTextColor(C_SOFT, C_PANEL);
       tft.drawString(fitPx(wmoText(weather.code), 108), 66, 92);
 
-      tft.setTextColor(TFT_WHITE, C_PANEL); tft.setTextDatum(TR_DATUM);
+      tft.setTextColor(C_TEXT, C_PANEL); tft.setTextDatum(TR_DATUM);
       snprintf(buf, sizeof(buf), "%s %d %s", compass(weather.windDir), (int)lroundf(weather.wind), WIND_UNIT);
       tft.drawString(buf, 308, 40);
       snprintf(buf, sizeof(buf), "%d%%", weather.humidity);
@@ -1821,48 +1865,48 @@ void screenWeatherSystem(bool newPage) {
   else if (up >= 3600) snprintf(buf, sizeof(buf), "%luh %02lum", (unsigned long)(up / 3600), (unsigned long)((up % 3600) / 60));
   else snprintf(buf, sizeof(buf), "%lum %02lus", (unsigned long)(up / 60), (unsigned long)(up % 60));
   tft.fillRect(40, 140, 112, 26, C_PANEL);
-  tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.setFreeFont(&FreeSansBold12pt7b); tft.setTextColor(C_TEXT, C_PANEL);
   tft.drawString(buf, 42, 141);
 
   bool online = WiFi.status() == WL_CONNECTED;
   tft.fillRect(168, 140, 144, 28, C_PANEL);
   tft.fillRect(240, 126, 72, 14, C_PANEL);
-  iconWifi(180, 163, wifiBars(), online ? C_CYAN : TFT_ORANGE, C_TRACK, C_PANEL);
+  iconWifi(180, 163, wifiBars(), online ? C_CYAN : C_WARN, C_TRACK, C_PANEL);
   if (online) { snprintf(buf, sizeof(buf), "%d dBm", WiFi.RSSI()); }
   else snprintf(buf, sizeof(buf), "no link");
-  tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(C_TEXT, C_PANEL);
   tft.drawString(buf, 200, 146);
   pill(244, 127, 66, 12, online ? "CONNECTED" : "OFFLINE", online ? C_PILLOK : TFT_RED, online ? TFT_BLACK : TFT_WHITE);
 
   // Memory: free / total heap, bar = used share; largest free block (TLS needs ~45 KB)
   uint32_t freeH = ESP.getFreeHeap(), totalH = ESP.getHeapSize(), blk = ESP.getMaxAllocHeap();
   tft.fillRect(34, 192, 72, 40, C_PANEL);
-  tft.setTextFont(2); tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.setTextFont(2); tft.setTextColor(C_TEXT, C_PANEL);
   snprintf(buf, sizeof(buf), "%u/%uK", (unsigned)(freeH / 1024), (unsigned)(totalH / 1024));
   tft.drawString(buf, 36, 194);
-  tft.setTextFont(1); tft.setTextColor(blk < 45000 ? TFT_ORANGE : C_SOFT, C_PANEL);
+  tft.setTextFont(1); tft.setTextColor(blk < 45000 ? C_WARN : C_SOFT, C_PANEL);
   snprintf(buf, sizeof(buf), "blk %uK", (unsigned)(blk / 1024));
   tft.drawString(buf, 36, 212);
   int used = totalH ? (int)(88L * (totalH - freeH) / totalH) : 0;
   tft.fillRoundRect(12, 224, 88, 5, 2, C_TRACK);
-  tft.fillRoundRect(12, 224, max(4, used), 5, 2, blk < 45000 ? TFT_ORANGE : C_GREEN);
+  tft.fillRoundRect(12, 224, max(4, used), 5, 2, blk < 45000 ? C_WARN : C_GREEN);
 
   // API status: online if data arrived within a minute
   uint32_t ago = lastOkMs ? (millis() - lastOkMs) / 1000 : 0;
   const char* st; uint16_t sc, sf = TFT_BLACK;
   if (!online) { st = "Offline"; sc = TFT_RED; sf = TFT_WHITE; }
   else if (lastOkMs && ago < 60) { st = "Online"; sc = C_PILLOK; }
-  else if (lastOkMs) { st = "Stale"; sc = TFT_ORANGE; }
-  else { st = "Waiting"; sc = C_TRACK; sf = TFT_WHITE; }
+  else if (lastOkMs) { st = "Stale"; sc = C_WARN; }
+  else { st = "Waiting"; sc = C_TRACK; sf = C_TEXT; }
   tft.fillRect(146, 198, 64, 36, C_PANEL);
   pill(148, 202, 58, 18, st, sc, sf);
   if (lastFetchErr[0] && !(lastOkMs && ago < 60)) {
-    tft.setTextFont(1); tft.setTextColor(TFT_ORANGE, C_PANEL);
+    tft.setTextFont(1); tft.setTextColor(C_WARN, C_PANEL);
     tft.drawString(fitPx(lastFetchErr, 90), 118, 225);
   }
 
   tft.fillRect(248, 198, 64, 30, C_PANEL);
-  tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(C_TEXT, C_PANEL);
   if (!lastOkMs) snprintf(buf, sizeof(buf), "--");
   else if (ago < 120) snprintf(buf, sizeof(buf), "%lus", (unsigned long)ago);
   else if (ago < 7200) snprintf(buf, sizeof(buf), "%lum", (unsigned long)(ago / 60));
@@ -1875,14 +1919,14 @@ void screenWeatherSystem(bool newPage) {
 // 5. SETTINGS
 // ===========================================================================
 struct MenuBtn { int x, y, w, h; };
-const int MENU_N = 8;
+const int MENU_N = 9;
 const MenuBtn MENU_BTNS[MENU_N] = {
   {4, 30, 154, 52},  {162, 30, 154, 52},
   {4, 86, 154, 52},  {162, 86, 154, 52},
   {4, 142, 154, 52}, {162, 142, 154, 52},
-  {4, 198, 154, 38}, {162, 198, 154, 38},
+  {4, 198, 52, 38},  {186, 198, 130, 38}, {60, 198, 122, 38},
 };
-enum { MB_WIFI, MB_LOCATE, MB_CALIBRATE, MB_BRIGHT, MB_LED, MB_NAV, MB_BACK, MB_UPDATE };
+enum { MB_WIFI, MB_LOCATE, MB_CALIBRATE, MB_BRIGHT, MB_LED, MB_NAV, MB_BACK, MB_UPDATE, MB_THEME };
 
 int menuButtonAt(int sx, int sy) {
   for (int i = 0; i < MENU_N; i++) {
@@ -1906,7 +1950,7 @@ void menuCard(int i, const char* title, const char* sub, uint16_t edge) {
     case MB_LED:       iconBell(ix, iy, C_CYAN); break;
     case MB_NAV:       iconGear(ix, iy, C_CYAN, C_PANEL); break;
   }
-  tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
+  tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(C_TEXT, C_PANEL);
   tft.drawString(title, b.x + 38, b.y + 8);
   tft.setTextFont(2); tft.setTextColor(C_SOFT, C_PANEL);
   tft.drawString(fitPx(sub, b.w - 56), b.x + 38, b.y + 29);
@@ -1927,6 +1971,7 @@ void screenSettings(bool newPage) {
   static char lastStatus[48] = "";
   bool updArmed = stillBefore(updConfirmUntil), updAvail = ghAvailable();
   uint32_t key = (wifiArmed ? 1 : 0) | (ledAlerts ? 2 : 0) | (navButtons ? 4 : 0) | (online ? 8 : 0) |
+                 ((uint32_t)themeIdx << 24) |
                  ((uint32_t)ghState << 4) | (updArmed ? 0x40 : 0) | (updAvail ? 0x80 : 0) |
                  ((uint32_t)backlightPct << 8) | ((uint32_t)(name[0] + name[1] * 3 + ghLatest[1] * 5) << 16);
   if (!newPage && key == lastKey && strcmp(lastStatus, statusMsg) == 0) return;
@@ -1936,7 +1981,7 @@ void screenSettings(bool newPage) {
   if (newPage) tft.fillRect(0, 26, 320, 214, C_BG);
   char buf[40];
   String wifiSub = wifiArmed ? String("Tap again") : online ? WiFi.localIP().toString() : String("Not connected");
-  menuCard(MB_WIFI, "WiFi", wifiSub.c_str(), wifiArmed ? TFT_ORANGE : C_EDGE);
+  menuCard(MB_WIFI, "WiFi", wifiSub.c_str(), wifiArmed ? C_WARN : C_EDGE);
   bool locating = strcmp(statusMsg, "Locating...") == 0;
   menuCard(MB_LOCATE, "Location", locating ? "Locating..." : name, C_EDGE);
   menuCard(MB_CALIBRATE, "Calibrate", strcmp(statusMsg, "Touch calibrated") == 0 ? "Saved" : "Touch screen", C_EDGE);
@@ -1948,32 +1993,43 @@ void screenSettings(bool newPage) {
   const MenuBtn& bb = MENU_BTNS[MB_BACK];
   tft.fillRoundRect(bb.x, bb.y, bb.w, bb.h, 6, C_PANEL);
   tft.drawRoundRect(bb.x, bb.y, bb.w, bb.h, 6, C_EDGE);
-  int ax = bb.x + 50, ay = bb.y + bb.h / 2;
-  tft.fillTriangle(ax - 8, ay, ax - 1, ay - 6, ax - 1, ay + 6, TFT_WHITE);
-  tft.fillRect(ax - 2, ay - 1, 12, 3, TFT_WHITE);
-  tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
-  tft.drawString("Back", ax + 18, bb.y + 10);
+  int ax = bb.x + bb.w / 2 - 2, ay = bb.y + bb.h / 2;
+  tft.fillTriangle(ax - 8, ay, ax - 1, ay - 6, ax - 1, ay + 6, C_TEXT);
+  tft.fillRect(ax - 2, ay - 1, 12, 3, C_TEXT);
+
+  // Theme: each tap switches to the next color theme
+  const MenuBtn& tb = MENU_BTNS[MB_THEME];
+  tft.fillRoundRect(tb.x, tb.y, tb.w, tb.h, 6, C_PANEL);
+  tft.drawRoundRect(tb.x, tb.y, tb.w, tb.h, 6, C_EDGE);
+  int sy = tb.y + tb.h / 2;
+  tft.fillCircle(tb.x + 13, sy, 5, C_CYAN);
+  tft.fillCircle(tb.x + 21, sy, 5, C_GREEN);
+  tft.drawCircle(tb.x + 21, sy, 6, C_PANEL);
+  tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(C_TEXT, C_PANEL);
+  tft.drawString(fitPx(THEMES[themeIdx].name, tb.w - 38), tb.x + 33, tb.y + 10);
   tft.setTextFont(2);
 
   // Update: one tap checks GitHub; when a newer release exists, tap twice to install it
   const MenuBtn& ub = MENU_BTNS[MB_UPDATE];
-  uint16_t edge = updArmed ? TFT_ORANGE : updAvail ? C_GREEN : C_EDGE;
+  uint16_t edge = updArmed ? C_WARN : updAvail ? C_GREEN : C_EDGE;
   tft.fillRoundRect(ub.x, ub.y, ub.w, ub.h, 6, C_PANEL);
   tft.drawRoundRect(ub.x, ub.y, ub.w, ub.h, 6, edge);
   if (edge != C_EDGE) tft.drawRoundRect(ub.x + 1, ub.y + 1, ub.w - 2, ub.h - 2, 5, edge);
-  iconRefresh(ub.x + 19, ub.y + ub.h / 2 + 1, updAvail ? C_GREEN : C_CYAN, C_PANEL);
+
   char ul[32];
-  if (!online)                    snprintf(ul, sizeof(ul), "Update: no WiFi");
+  if (!online)                    snprintf(ul, sizeof(ul), "No WiFi");
   else if (updArmed)              snprintf(ul, sizeof(ul), "Tap again");
   else if (ghState == GH_CHECKING) snprintf(ul, sizeof(ul), "Checking...");
   else if (ghState == GH_DOWNLOADING) snprintf(ul, sizeof(ul), "Updating...");
   else if (ghState == GH_FAILED)  snprintf(ul, sizeof(ul), "Failed, retry");
   else if (updAvail)              snprintf(ul, sizeof(ul), "Update %s", ghLatest);
   else if (ghLatest[0])           snprintf(ul, sizeof(ul), "Up to date");
-  else                            snprintf(ul, sizeof(ul), "Check update");
+  else                            snprintf(ul, sizeof(ul), "Updates");
   tft.setFreeFont(&FreeSansBold9pt7b);
-  tft.setTextColor(updArmed ? TFT_ORANGE : updAvail ? C_GREEN : TFT_WHITE, C_PANEL);
-  tft.drawString(fitPx(ul, ub.w - 44), ub.x + 36, ub.y + 10);
+  tft.setTextColor(updArmed ? C_WARN : updAvail ? C_GREEN : C_TEXT, C_PANEL);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString(fitPx(ul, ub.w - 12), ub.x + ub.w / 2, ub.y + 10);
+  tft.setTextDatum(TL_DATUM);
   tft.setTextFont(2);
 }
 
@@ -2276,6 +2332,13 @@ bool nightNow() {
 // Screen is dimmed for the night right now (not woken by a tap)
 bool nightDimmed() { return nightCfg.level < backlightPct && nightNow() && !stillBefore(nightWakeUntil); }
 
+// Picks the active theme (Night Red at night if enabled); a change redraws the page
+void themeUpdate() {
+  const Theme* want = &THEMES[themeIdx];
+  if (nightRedTheme && nightNow()) want = &THEMES[THEME_NIGHT_RED];
+  if (want != th) { th = want; lastScreen = 255; }
+}
+
 void nightUpdate() {
   applyBacklight(nightDimmed() ? nightCfg.level : backlightPct);
 }
@@ -2440,6 +2503,10 @@ void handleMenuButton(int b) {
     case MB_NAV:
       navButtons = !navButtons;
       prefs.putBool("navbtn", navButtons);
+      break;
+    case MB_THEME:
+      themeIdx = (themeIdx + 1) % NUM_THEMES;
+      prefs.putUChar("theme", themeIdx);
       break;
     case MB_UPDATE:
       if (WiFi.status() != WL_CONNECTED) break;
@@ -2677,6 +2744,9 @@ void initWebServer() {
     if (configMutex) xSemaphoreGive(configMutex);
     auto hhmm = [](uint16_t m) { char b[8]; snprintf(b, sizeof(b), "%02u:%02u", (m / 60) % 24, m % 60); return String(b); };
     auto sel = [](bool b) { return b ? String(" selected") : String(""); };
+    String themeOptions;
+    for (int i = 0; i < NUM_THEMES; i++)
+      themeOptions += String("<option value=\"") + i + "\"" + sel(i == themeIdx) + ">" + THEMES[i].name + "</option>";
     String rollback = previousFirmware()
         ? String("<button type=\"button\" class=\"opt\" style=\"text-align:center\" onclick=\"rollback()\">Switch back to ") +
           (prevFwVersion.length() ? prevFwVersion : String("the previous firmware")) + "</button>"
@@ -2794,6 +2864,13 @@ void initWebServer() {
   <div class="hint" id="nst">)rawliteral" + String(notifyStatus) + R"rawliteral(</div>
   <button type="button" onclick="saveNotify()">Save notifications</button>
   <button type="button" class="opt" style="text-align:center" onclick="testNotify()">Send test notification</button>
+</div>
+<div class="card">
+  <h2>Theme</h2>
+  <select id="thm" style="width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em">)rawliteral" + themeOptions + R"rawliteral(</select>
+  <label class="chk"><input type="checkbox" id="thr")rawliteral" + chk(nightRedTheme) + R"rawliteral(> Switch to Night Red during night mode</label>
+  <div class="hint">Also on the device: Settings, the button with two colored dots.</div>
+  <button type="button" onclick="saveTheme()">Save theme</button>
 </div>
 <div class="card">
   <h2>Night mode</h2>
@@ -2924,6 +3001,9 @@ function testNotify(){
     $('nst').textContent='Sending...';
     post('/notify-test','',function(){setTimeout(function(){fetch('/notify-status').then(function(r){return r.text()}).then(function(t){$('nst').textContent=t})},4000)});
   });
+}
+function saveTheme(){
+  post('/theme','t='+$('thm').value+'&nr='+($('thr').checked?1:0),function(x){flash(x.status==200?'✓ Theme saved!':x.responseText)});
 }
 function saveNight(){
   var t=function(i){var v=$(i).value.split(':');return (+v[0])*60+(+v[1]||0)};
@@ -3139,6 +3219,16 @@ function forget(){
   });
   server.on("/notify-status", HTTP_GET, []() { server.send(200, "text/plain", notifyStatus); });
 
+  // POST /theme — color theme
+  server.on("/theme", HTTP_POST, []() {
+    int t = server.arg("t").toInt();
+    if (t < 0 || t >= NUM_THEMES) { server.send(400, "text/plain", "Invalid theme"); return; }
+    themeIdx = t; nightRedTheme = server.arg("nr") == "1";
+    prefs.putUChar("theme", themeIdx);
+    prefs.putBool("night_red", nightRedTheme);
+    server.send(200, "text/plain", "OK");
+  });
+
   // POST /night — night mode settings
   server.on("/night", HTTP_POST, []() {
     int m = server.arg("m").toInt(), f = server.arg("f").toInt(), t = server.arg("t").toInt(), l = server.arg("l").toInt();
@@ -3329,6 +3419,10 @@ void setup() {
   PREF("ntf_low", getInt, notifyCfg.lowAltFt);
   PREF("ntf_cool", getUChar, notifyCfg.coolH);
   PREF("ntf_quiet", getBool, notifyCfg.quietNight);
+  PREF("theme", getUChar, themeIdx);
+  if (themeIdx >= NUM_THEMES) themeIdx = 0;
+  PREF("night_red", getBool, nightRedTheme);
+  th = &THEMES[themeIdx];
   PREF("night_mode", getUChar, nightCfg.mode);
   PREF("night_from", getUShort, nightCfg.fromMin);
   PREF("night_to", getUShort, nightCfg.toMin);
@@ -3389,6 +3483,7 @@ void loop() {
   if (!bootOk && millis() > 60000) { bootOk = true; if (prefs.getUChar("bootfail", 0)) prefs.putUChar("bootfail", 0); }
 
   checkTouch();
+  themeUpdate();
   nightUpdate();
   render();
   updateNavOverlay();
