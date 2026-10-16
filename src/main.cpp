@@ -135,6 +135,7 @@ char ghLatest[24] = "";                   // tag of the latest release, e.g. "v1
 char ghMsg[64] = "";                      // last check / update error
 uint32_t ghCheckedMs = 0;
 const uint32_t GH_CHECK_INTERVAL_MS = 12UL * 3600 * 1000;
+bool ghAvailable() { return ghLatest[0] && strcmp(ghLatest, FW_VERSION) != 0; }
 
 // ---- Back RGB LED (CYD: R=GPIO4, G=GPIO16, B=GPIO17, common anode = active LOW) ----
 #define LED_PIN_R 4
@@ -252,6 +253,7 @@ uint8_t screen = 0;
 uint8_t lastScreen = 255;
 uint32_t lastTouchMs = 0;
 uint32_t wifiConfirmUntil = 0;   // "WiFi setup" needs a second tap within 3 s
+uint32_t updConfirmUntil = 0;    // "Update" (install) needs a second tap within 3 s
 volatile bool portalRequested = false;
 volatile bool calibrateRequested = false;   // from the settings menu or the web page
 const uint8_t NUM_SCREENS = 4;              // screens cycled by tapping
@@ -1641,14 +1643,14 @@ void screenWeatherSystem(bool newPage) {
 // 5. SETTINGS
 // ===========================================================================
 struct MenuBtn { int x, y, w, h; };
-const int MENU_N = 7;
+const int MENU_N = 8;
 const MenuBtn MENU_BTNS[MENU_N] = {
   {4, 30, 154, 52},  {162, 30, 154, 52},
   {4, 86, 154, 52},  {162, 86, 154, 52},
   {4, 142, 154, 52}, {162, 142, 154, 52},
-  {4, 198, 312, 38},
+  {4, 198, 154, 38}, {162, 198, 154, 38},
 };
-enum { MB_WIFI, MB_LOCATE, MB_CALIBRATE, MB_BRIGHT, MB_LED, MB_NAV, MB_BACK };
+enum { MB_WIFI, MB_LOCATE, MB_CALIBRATE, MB_BRIGHT, MB_LED, MB_NAV, MB_BACK, MB_UPDATE };
 
 int menuButtonAt(int sx, int sy) {
   for (int i = 0; i < MENU_N; i++) {
@@ -1691,8 +1693,10 @@ void screenSettings(bool newPage) {
   // Redraw when anything shown on the cards changes
   static uint32_t lastKey = 0xFFFFFFFF;
   static char lastStatus[48] = "";
+  bool updArmed = stillBefore(updConfirmUntil), updAvail = ghAvailable();
   uint32_t key = (wifiArmed ? 1 : 0) | (ledAlerts ? 2 : 0) | (navButtons ? 4 : 0) | (online ? 8 : 0) |
-                 ((uint32_t)backlightPct << 8) | ((uint32_t)(name[0] + name[1] * 3) << 16);
+                 ((uint32_t)ghState << 4) | (updArmed ? 0x40 : 0) | (updAvail ? 0x80 : 0) |
+                 ((uint32_t)backlightPct << 8) | ((uint32_t)(name[0] + name[1] * 3 + ghLatest[1] * 5) << 16);
   if (!newPage && key == lastKey && strcmp(lastStatus, statusMsg) == 0) return;
   lastKey = key; strcpy(lastStatus, statusMsg);
 
@@ -1712,11 +1716,32 @@ void screenSettings(bool newPage) {
   const MenuBtn& bb = MENU_BTNS[MB_BACK];
   tft.fillRoundRect(bb.x, bb.y, bb.w, bb.h, 6, C_PANEL);
   tft.drawRoundRect(bb.x, bb.y, bb.w, bb.h, 6, C_EDGE);
-  int ax = 132, ay = bb.y + bb.h / 2;
+  int ax = bb.x + 50, ay = bb.y + bb.h / 2;
   tft.fillTriangle(ax - 8, ay, ax - 1, ay - 6, ax - 1, ay + 6, TFT_WHITE);
   tft.fillRect(ax - 2, ay - 1, 12, 3, TFT_WHITE);
   tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
-  tft.drawString("Back", 152, bb.y + 10);
+  tft.drawString("Back", ax + 18, bb.y + 10);
+  tft.setTextFont(2);
+
+  // Update: one tap checks GitHub; when a newer release exists, tap twice to install it
+  const MenuBtn& ub = MENU_BTNS[MB_UPDATE];
+  uint16_t edge = updArmed ? TFT_ORANGE : updAvail ? C_GREEN : C_EDGE;
+  tft.fillRoundRect(ub.x, ub.y, ub.w, ub.h, 6, C_PANEL);
+  tft.drawRoundRect(ub.x, ub.y, ub.w, ub.h, 6, edge);
+  if (edge != C_EDGE) tft.drawRoundRect(ub.x + 1, ub.y + 1, ub.w - 2, ub.h - 2, 5, edge);
+  iconRefresh(ub.x + 19, ub.y + ub.h / 2 + 1, updAvail ? C_GREEN : C_CYAN, C_PANEL);
+  char ul[32];
+  if (!online)                    snprintf(ul, sizeof(ul), "Update: no WiFi");
+  else if (updArmed)              snprintf(ul, sizeof(ul), "Tap again");
+  else if (ghState == GH_CHECKING) snprintf(ul, sizeof(ul), "Checking...");
+  else if (ghState == GH_DOWNLOADING) snprintf(ul, sizeof(ul), "Updating...");
+  else if (ghState == GH_FAILED)  snprintf(ul, sizeof(ul), "Failed, retry");
+  else if (updAvail)              snprintf(ul, sizeof(ul), "Update %s", ghLatest);
+  else if (ghLatest[0])           snprintf(ul, sizeof(ul), "Up to date");
+  else                            snprintf(ul, sizeof(ul), "Check update");
+  tft.setFreeFont(&FreeSansBold9pt7b);
+  tft.setTextColor(updArmed ? TFT_ORANGE : updAvail ? C_GREEN : TFT_WHITE, C_PANEL);
+  tft.drawString(fitPx(ul, ub.w - 44), ub.x + 36, ub.y + 10);
   tft.setTextFont(2);
 }
 
@@ -2118,6 +2143,7 @@ void openSettings() {
   screen = SCREEN_SETTINGS;
   statusMsg[0] = '\0';
   wifiConfirmUntil = 0;
+  updConfirmUntil = 0;
 }
 
 void handleMenuButton(int b) {
@@ -2150,6 +2176,19 @@ void handleMenuButton(int b) {
     case MB_NAV:
       navButtons = !navButtons;
       prefs.putBool("navbtn", navButtons);
+      break;
+    case MB_UPDATE:
+      if (WiFi.status() != WL_CONNECTED) break;
+      if (ghState == GH_CHECKING || ghState == GH_DOWNLOADING) break;
+      if (ghAvailable()) {
+        // Installing restarts the device, so it needs a confirming second tap
+        if (stillBefore(updConfirmUntil)) {
+          updConfirmUntil = 0;
+          ghMsg[0] = '\0'; ghPct = 0; ghState = GH_DOWNLOADING; ghUpdateRequested = true;
+        } else updConfirmUntil = millis() + 3000;
+      } else {
+        ghState = GH_CHECKING; ghCheckRequested = true;   // "check now"
+      }
       break;
     case MB_BACK:
       screen = screenBeforeSettings;
@@ -2635,7 +2674,7 @@ function forget(){
     JsonDocument d;
     d["cur"] = FW_VERSION; d["env"] = BUILD_ENV;
     d["latest"] = ghLatest; d["state"] = names[ghState]; d["pct"] = (int)ghPct; d["msg"] = ghMsg;
-    d["available"] = ghLatest[0] && strcmp(ghLatest, FW_VERSION) != 0;
+    d["available"] = ghAvailable();
     String out; serializeJson(d, out);
     server.send(200, "application/json", out);
   });
