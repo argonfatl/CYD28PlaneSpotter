@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to (re)build the release for
+        description: Release tag, e.g. v1.0.0 (created on the selected branch if it doesn't exist)
         required: true
 
 permissions:
@@ -22,9 +22,8 @@ jobs:
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
+      # Tag push: the tagged commit. Manual run: the selected branch.
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TAG }}
 
       - uses: actions/setup-python@v5
         with:
@@ -76,7 +75,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
           fetch-depth: 0
 
       - uses: actions/download-artifact@v4
@@ -112,5 +110,6 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/*.bin --clobber
           else
-            gh release create "$TAG" dist/*.bin --title "$TAG" --notes-file notes.md
+            # Creates the tag at the built commit when it doesn't exist yet
+            gh release create "$TAG" dist/*.bin --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA"
           fi
