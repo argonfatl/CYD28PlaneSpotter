@@ -2,6 +2,14 @@
 
 A real-time aircraft tracker for the **ESP32 Cheap Yellow Display (CYD)** that renders a live radar PPI (Plan Position Indicator), shows nearby aircraft details, and provides weather & system status — all on a 2.8" 240×320 TFT touchscreen.
 
+| Nearest aircraft | Traffic near you |
+|:---:|:---:|
+| ![Nearest aircraft: flight card with route, altitude, speed, heading and climb rate](docs/images/nearest.jpg) | ![Traffic: the five closest flights with route, altitude and distance](docs/images/traffic.jpg) |
+| **Radar** | **Weather & status** |
+| ![Radar: sweep with aircraft blips and range presets](docs/images/radar.jpg) | ![Weather and device status: temperature, wind, WiFi, memory, data source](docs/images/weather.jpg) |
+
+*Running on an ESP32-2432S028R with the HSD028309 panel (`cyd-alt` build).*
+
 ## Features
 
 - **Nearest aircraft** — a flight card for the nearest (or a tapped) aircraft: callsign and flight number, airline, aircraft model and registration, route with city names and a progress bar, altitude, speed, distance/bearing and climb/descent rate.
