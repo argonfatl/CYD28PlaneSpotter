@@ -1,0 +1,81 @@
+name: Build firmware
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [cyd, cyd-alt, cyd2usb]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build ${{ matrix.env }}
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -o pipefail
+          export PLATFORMIO_BUILD_FLAGS="-DFW_VERSION=\\\"${SHA::7}\\\""
+          pio run -e ${{ matrix.env }} 2>&1 | tee build.log
+
+      # Surface memory usage and our own compiler warnings as annotations
+      - name: Report size and warnings
+        if: always()
+        run: |
+          grep -E "^(RAM|Flash):" build.log | while read -r l; do echo "::notice title=${{ matrix.env }} size::$l"; done
+          grep -E "^(src|lib)/[^:]+:[0-9]+:[0-9]+: warning:" build.log | sort -u | head -40 | while IFS= read -r l; do
+            f=${l%%:*}; rest=${l#*:}; line=${rest%%:*}
+            echo "::warning file=$f,line=$line::${l#*warning: }"
+          done
+          # Compiler errors (any file) and, on failure, the end of the log
+          grep -E ":[0-9]+:[0-9]+: (fatal )?error:" build.log | sort -u | head -20 | while IFS= read -r l; do
+            echo "::error::$l"
+          done
+          if ! grep -q "\[SUCCESS\]" build.log; then
+            # One multi-line annotation (GitHub keeps only a few per step)
+            msg=$(grep -v -E "^(Downloading|Unpacking) " build.log | tail -40 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=build log tail::$msg"
+          fi
+
+      # One image that can be flashed at offset 0x0 with any tool,
+      # e.g. https://espressif.github.io/esptool-js/ — no PlatformIO needed
+      - name: Create merged flash image
+        run: |
+          B=.pio/build/${{ matrix.env }}
+          BOOT_APP0=$(find ~/.platformio/packages/framework-arduinoespressif32 -name boot_app0.bin | head -1)
+          pio pkg exec -p tool-esptoolpy -- esptool.py --chip esp32 merge_bin \
+            -o $B/${{ matrix.env }}-merged.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000 $B/bootloader.bin \
+            0x8000 $B/partitions.bin \
+            0xe000 "$BOOT_APP0" \
+            0x10000 $B/firmware.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.env }}
+          path: |
+            .pio/build/${{ matrix.env }}/firmware.bin
+            .pio/build/${{ matrix.env }}/${{ matrix.env }}-merged.bin
