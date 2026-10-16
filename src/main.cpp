@@ -20,6 +20,7 @@
 #include <XPT2046_Touchscreen.h>
 #include <WiFiManager.h>
 #include <Update.h>
+#include <HTTPUpdate.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <cydqr.h>
@@ -51,6 +52,9 @@
 #endif
 #ifndef BUILD_ENV
 #define BUILD_ENV "custom"
+#endif
+#ifndef GITHUB_REPO
+#define GITHUB_REPO "argonfatl/CYD28PlaneSpotter"   // releases for "Update from GitHub"
 #endif
 #ifndef DEVICE_HOSTNAME
 #define DEVICE_HOSTNAME "planespotter"   // http://planespotter.local
@@ -121,6 +125,16 @@ volatile bool ipLocateRequested = false;  // "Locate by IP" button
 char statusMsg[48] = "";                  // one-line feedback on the settings screen
 volatile bool otaActive = false;          // firmware update in progress: pause fetching/drawing
 volatile bool portalActive = false;       // WiFi setup portal running: pause fetching
+
+// Update from GitHub releases (web page). Checks and the download run in the fetch task.
+enum GhState : uint8_t { GH_IDLE, GH_CHECKING, GH_DOWNLOADING, GH_FAILED };
+volatile GhState ghState = GH_IDLE;
+volatile bool ghCheckRequested = false, ghUpdateRequested = false;
+volatile int ghPct = 0;
+char ghLatest[24] = "";                   // tag of the latest release, e.g. "v1.1.0"
+char ghMsg[64] = "";                      // last check / update error
+uint32_t ghCheckedMs = 0;
+const uint32_t GH_CHECK_INTERVAL_MS = 12UL * 3600 * 1000;
 
 // ---- Back RGB LED (CYD: R=GPIO4, G=GPIO16, B=GPIO17, common anode = active LOW) ----
 #define LED_PIN_R 4
@@ -779,6 +793,62 @@ bool fetchWeatherTo(Weather& w) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Update from GitHub: latest release tag, then <env>-firmware.bin from that release
+// ---------------------------------------------------------------------------
+void drawOtaScreen(const char* line1, const char* line2, int pct);
+
+void checkLatestRelease() {
+  ghState = GH_CHECKING;
+  JsonDocument filter; filter["tag_name"] = true;
+  JsonDocument d;
+  char err[72] = "";
+  int code = httpGetJson("https://api.github.com/repos/" GITHUB_REPO "/releases/latest", d, &filter, err, sizeof(err));
+  ghCheckedMs = millis() | 1;
+  if (code == HTTP_CODE_OK && d["tag_name"].is<const char*>()) {
+    copyAscii(ghLatest, d["tag_name"].as<const char*>(), sizeof(ghLatest));
+    ghMsg[0] = '\0';
+    Serial.printf("Latest release: %s (running %s)\n", ghLatest, FW_VERSION);
+  } else if (code == HTTP_CODE_NOT_FOUND) {
+    snprintf(ghMsg, sizeof(ghMsg), "no releases yet");
+  } else {
+    snprintf(ghMsg, sizeof(ghMsg), "check failed: %s", err);
+  }
+  ghState = GH_IDLE;
+}
+
+void runGithubUpdate() {
+  if (!ghLatest[0]) checkLatestRelease();
+  if (!ghLatest[0]) { ghState = GH_FAILED; return; }
+  String url = String("https://github.com/" GITHUB_REPO "/releases/download/") + ghLatest +
+               "/" BUILD_ENV "-firmware.bin";
+  Serial.printf("Updating from %s\n", url.c_str());
+  ghState = GH_DOWNLOADING; ghPct = 0;
+  otaActive = true;                      // loop() stops drawing; wait for a frame to finish
+  vTaskDelay(pdMS_TO_TICKS(300));
+  drawOtaScreen("Downloading update...", ghLatest, 0);
+
+  WiFiClientSecure client; client.setInsecure();
+  httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);   // GitHub redirects to its CDN
+  httpUpdate.rebootOnUpdate(false);
+  httpUpdate.onProgress([](int done, int total) {
+    ghPct = total > 0 ? (int)(done * 100LL / total) : 0;
+    drawOtaScreen("Downloading update...", ghLatest, ghPct);
+  });
+  t_httpUpdate_return r = httpUpdate.update(client, url);
+  if (r == HTTP_UPDATE_OK) {
+    drawOtaScreen("Update complete", "Restarting...", 100);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP.restart();
+  }
+  snprintf(ghMsg, sizeof(ghMsg), "update failed: %s", httpUpdate.getLastErrorString().c_str());
+  Serial.println(ghMsg);
+  ghState = GH_FAILED;
+  drawOtaScreen("Update failed", ghMsg, -1);
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  otaActive = false; lastScreen = 255;
+}
+
 // ===================================================================
 // Background Data Fetcher — runs on Core 0 so Core 1 stays smooth
 // ===================================================================
@@ -799,6 +869,13 @@ void dataFetcherTask(void* param) {
     if (otaActive || portalActive) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
     refreshRequested = false;
     if (WiFi.status() == WL_CONNECTED) {
+      // Update from GitHub (web page), and the release check (on request, at boot, twice a day)
+      if (ghUpdateRequested) { ghUpdateRequested = false; runGithubUpdate(); }
+      if (ghCheckRequested || !ghCheckedMs || millis() - ghCheckedMs >= GH_CHECK_INTERVAL_MS) {
+        ghCheckRequested = false;
+        checkLatestRelease();
+      }
+
       // "Locate by IP" from the settings screen
       if (ipLocateRequested) {
         ipLocateRequested = false;
@@ -844,7 +921,7 @@ void dataFetcherTask(void* param) {
 
     // Wait for the next poll interval; a location change or button press cuts it short
     for (int t = 0; t < UPDATE_INTERVAL_MS / 250; t++) {
-      if (refreshRequested || ipLocateRequested) {
+      if (refreshRequested || ipLocateRequested || ghCheckRequested || ghUpdateRequested) {
         if (refreshRequested) weatherDone = false;  // new location -> new weather too
         break;
       }
@@ -2344,6 +2421,10 @@ void initWebServer() {
   <div style="font-size:0.9em;color:#aaa">Version <b>)rawliteral" + String(FW_VERSION) + R"rawliteral(</b>, build <b>)rawliteral" + String(BUILD_ENV) + R"rawliteral(</b>. Upload <code>firmware.bin</code> or <code>*-merged.bin</code> from the <b>)rawliteral" + String(BUILD_ENV) + R"rawliteral(</b> build on GitHub.</div>
   <input type="file" id="fw" accept=".bin" style="margin-top:12px">
   <progress id="fwp" max="100" value="0" style="width:100%;margin-top:10px;display:none"></progress>
+  <div id="gh" style="font-size:0.9em;color:#aaa;margin-top:12px">Checking GitHub...</div>
+  <button type="button" id="ghi" style="display:none" onclick="ghInstall()">Install from GitHub</button>
+  <button type="button" class="opt" style="text-align:center" onclick="ghCheck()">Check for updates</button>
+  <div class="hint" style="margin-top:14px">Or upload a file:</div>
   <div id="fws" class="hint"></div>
   <button type="button" onclick="upload()">Update firmware</button>
   <button type="button" class="opt" style="text-align:center" onclick="post('/calibrate','',function(){flash('Calibration started on the device screen')})">Calibrate touch screen</button>
@@ -2405,6 +2486,30 @@ function upload(){
   x.onerror=function(){st.textContent='Upload failed (connection lost)'};
   x.open('POST','/update',true);x.send(fd);
 }
+var ghBusy=false;
+function ghShow(s){
+  var t=$('gh'),b=$('ghi');
+  if(s.state=='checking'){t.textContent='Checking GitHub...';b.style.display='none';return}
+  if(s.state=='downloading'){t.textContent='Installing '+s.latest+': '+s.pct+'% - the device restarts when done';b.style.display='none';return}
+  var m=s.latest?'Latest release: '+s.latest+(s.available?'':' (installed)'):'Latest release: unknown';
+  if(s.msg)m+=' - '+s.msg;
+  t.textContent=m;
+  b.style.display=s.available?'block':'none';b.textContent='Install '+s.latest+' from GitHub';
+}
+function ghPoll(){
+  fetch('/update-status').then(function(x){return x.json()}).then(function(s){
+    ghShow(s);
+    if(s.state=='checking'||s.state=='downloading'){ghBusy=s.state=='downloading';setTimeout(ghPoll,1000)}
+  }).catch(function(){
+    if(ghBusy){$('gh').textContent='Restarting... this page reloads in 20 s';setTimeout(function(){location.reload()},20000)}
+  });
+}
+function ghCheck(){post('/update-check','',function(){setTimeout(ghPoll,300)})}
+function ghInstall(){
+  if(!confirm('Download and install the latest release from GitHub? The device restarts when done.'))return;
+  post('/update-github','',function(x){if(x.status!=200){flash(x.responseText);return}ghBusy=true;setTimeout(ghPoll,1000)});
+}
+ghPoll();
 function forget(){
   if(!confirm('Forget the saved WiFi network and restart into setup mode?'))return;
   var x=new XMLHttpRequest();x.open('POST','/wifi-reset',true);x.send();
@@ -2523,6 +2628,27 @@ function forget(){
   }, handleUpdateChunk);
   const char* hdrs[] = {"Content-Length"};
   server.collectHeaders(hdrs, 1);
+
+  // Update from GitHub: status, check now, install the latest release
+  server.on("/update-status", HTTP_GET, []() {
+    static const char* names[] = {"idle", "checking", "downloading", "failed"};
+    JsonDocument d;
+    d["cur"] = FW_VERSION; d["env"] = BUILD_ENV;
+    d["latest"] = ghLatest; d["state"] = names[ghState]; d["pct"] = (int)ghPct; d["msg"] = ghMsg;
+    d["available"] = ghLatest[0] && strcmp(ghLatest, FW_VERSION) != 0;
+    String out; serializeJson(d, out);
+    server.send(200, "application/json", out);
+  });
+  server.on("/update-check", HTTP_POST, []() {
+    if (ghState == GH_IDLE || ghState == GH_FAILED) { ghState = GH_CHECKING; ghCheckRequested = true; }
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/update-github", HTTP_POST, []() {
+    if (!ghLatest[0]) { server.send(409, "text/plain", "No release found yet - press Check for updates"); return; }
+    if (ghState == GH_DOWNLOADING) { server.send(409, "text/plain", "Update already running"); return; }
+    ghMsg[0] = '\0'; ghPct = 0; ghState = GH_DOWNLOADING; ghUpdateRequested = true;
+    server.send(200, "text/plain", "OK");
+  });
 
   // POST /calibrate — run touch calibration on the device
   server.on("/calibrate", HTTP_POST, []() {
