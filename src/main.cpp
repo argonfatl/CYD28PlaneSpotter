@@ -802,7 +802,7 @@ void checkLatestRelease() {
   ghState = GH_CHECKING;
   JsonDocument filter; filter["tag_name"] = true;
   JsonDocument d;
-  char err[72] = "";
+  char err[48] = "";
   int code = httpGetJson("https://api.github.com/repos/" GITHUB_REPO "/releases/latest", d, &filter, err, sizeof(err));
   ghCheckedMs = millis() | 1;
   if (code == HTTP_CODE_OK && d["tag_name"].is<const char*>()) {
