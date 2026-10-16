@@ -285,6 +285,7 @@ struct NightConfig {
   bool ledOff = true;             // back LED off at night
 } nightCfg;
 uint32_t nightWakeUntil = 0;
+bool nightNow();
 const uint32_t NIGHT_WAKE_MS = 30000;
 
 // Previous firmware (the other OTA slot) for "switch back"; names kept in NVS
