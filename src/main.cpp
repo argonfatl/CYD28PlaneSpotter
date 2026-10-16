@@ -1050,16 +1050,16 @@ void card(int x, int y, int w, int h) {
   tft.drawRoundRect(x, y, w, h, 6, C_EDGE);
 }
 
-// Rounded badge with centered text; returns its width (0 if it doesn't fit before maxX)
-int drawBadge(int x, int y, int h, const char* text, uint16_t bg, int maxX) {
-  tft.setFreeFont(&FreeSansBold9pt7b);
-  int w = tft.textWidth(text) + 12;
-  if (x + w > maxX) return 0;
+// Badge width for FreeSansBold9pt text
+int badgeWidth(const char* text) { tft.setFreeFont(&FreeSansBold9pt7b); return tft.textWidth(text) + 12; }
+
+// Rounded badge; caps are centered vertically (FreeSansBold9pt: ascent 13, cap height 12)
+int drawBadge(int x, int y, int h, const char* text, uint16_t bg) {
+  int w = badgeWidth(text);
   tft.fillRoundRect(x, y, w, h, 4, bg);
   tft.setTextColor(TFT_WHITE, bg);
-  tft.setTextDatum(MC_DATUM);
-  tft.drawString(text, x + w / 2, y + h / 2);
   tft.setTextDatum(TL_DATUM);
+  tft.drawString(text, x + 6, y + (h - 12) / 2 - 1);
   return w;
 }
 
@@ -1099,12 +1099,14 @@ void screenTargetIntel(bool newPage) {
   tft.setTextColor(TFT_WHITE, C_BG);
   tft.drawString(fitPx(a.callsign, 130), 6, 31);
   int bx = 6 + tft.textWidth(fitPx(a.callsign, 130)) + 7;
-  if (a.flightIata[0] && strcmp(a.flightIata, a.callsign) != 0) {
-    int w = drawBadge(bx, 30, 22, a.flightIata, C_BADGE, LX - 4);
-    if (w) bx += w + 4;
-  }
+  // Badges: flight number and type; if both don't fit, the type wins
   const char* tag = (a.dbFlags & 1) ? "MIL" : strcmp(a.category, "A7") == 0 ? "HELI" : a.type;
-  if (tag[0]) drawBadge(bx, 30, 22, tag, (a.dbFlags & 1) ? 0x9000 : C_BLUEB, LX - 4);
+  bool showFlight = a.flightIata[0] && strcmp(a.flightIata, a.callsign) != 0;
+  int wF = showFlight ? badgeWidth(a.flightIata) + 4 : 0, wT = tag[0] ? badgeWidth(tag) : 0;
+  int room = LX - 4 - bx;
+  if (wF + wT > room) { if (wT <= room) showFlight = false; else { wT = 0; if (wF - 4 > room) showFlight = false; } }
+  if (showFlight) bx += drawBadge(bx, 30, 22, a.flightIata, C_BADGE) + 4;
+  if (wT) drawBadge(bx, 30, 22, tag, (a.dbFlags & 1) ? 0x9000 : C_BLUEB);
 
   tft.setFreeFont(&FreeSans9pt7b);
   tft.setTextColor(TFT_WHITE, C_BG);

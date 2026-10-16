@@ -49,6 +49,13 @@ jobs:
             f=${l%%:*}; rest=${l#*:}; line=${rest%%:*}
             echo "::warning file=$f,line=$line::${l#*warning: }"
           done
+          # Compiler errors (any file) and, on failure, the end of the log
+          grep -E ":[0-9]+:[0-9]+: (fatal )?error:" build.log | sort -u | head -20 | while IFS= read -r l; do
+            echo "::error::$l"
+          done
+          if ! grep -q "\[SUCCESS\]" build.log; then
+            tail -25 build.log | sed 's/%/%25/g' | while IFS= read -r l; do echo "::notice title=log::$l"; done
+          fi
 
       # One image that can be flashed at offset 0x0 with any tool,
       # e.g. https://espressif.github.io/esptool-js/ — no PlatformIO needed
