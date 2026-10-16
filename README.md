@@ -125,4 +125,4 @@ MIT
 
 ## Releases
 
-Pushing a tag like `v1.0.0` builds all three boards and publishes a GitHub release with `<env>-merged.bin` and `<env>-firmware.bin` for each. The tag is shown as the firmware version on the web page.
+Pushing a tag like `v1.0.0`, or running the **Release** workflow from the Actions tab with a new tag name, builds all three boards and publishes a GitHub release with `<env>-merged.bin` and `<env>-firmware.bin` for each. The tag is shown as the firmware version on the web page.
