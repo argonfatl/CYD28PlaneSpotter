@@ -54,7 +54,9 @@ jobs:
             echo "::error::$l"
           done
           if ! grep -q "\[SUCCESS\]" build.log; then
-            tail -25 build.log | sed 's/%/%25/g' | while IFS= read -r l; do echo "::notice title=log::$l"; done
+            # One multi-line annotation (GitHub keeps only a few per step)
+            msg=$(grep -v -E "^(Downloading|Unpacking) " build.log | tail -40 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=build log tail::$msg"
           fi
 
       # One image that can be flashed at offset 0x0 with any tool,
