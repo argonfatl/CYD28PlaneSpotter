@@ -21,6 +21,7 @@
 #include <WiFiManager.h>
 #include <Update.h>
 #include <HTTPUpdate.h>
+#include <esp_ota_ops.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <cydqr.h>
@@ -241,6 +242,7 @@ CachedRoute routeCache[ROUTE_CACHE_SIZE];
 
 struct Weather {
   float temp; float wind; int humidity; int code; float pressure; int windDir; bool valid = false;
+  uint32_t sunrise = 0, sunset = 0;   // today's, unix time (for night mode)
 } weather;
 
 struct Stats {
@@ -271,7 +273,23 @@ float touchCal[6] = {0.0f, -0.086486f, 337.30f,    // sx = a*rx + b*ry + c
 
 // Screen backlight (GPIO21) via LEDC channel 0
 #define BL_CH 0
-uint8_t backlightPct = 100;
+uint8_t backlightPct = 100;       // day brightness, set from the settings menu
+uint8_t backlightApplied = 255;   // what the PWM currently outputs
+
+// Night mode: dim (or turn off) the screen at night; a tap wakes it for 30 s
+struct NightConfig {
+  uint8_t mode = 0;               // 0 off, 1 schedule, 2 sunset to sunrise
+  uint16_t fromMin = 22 * 60;     // schedule start, minutes after midnight
+  uint16_t toMin = 7 * 60;        // schedule end
+  uint8_t level = 10;             // night brightness in percent, 0 = screen off
+  bool ledOff = true;             // back LED off at night
+} nightCfg;
+uint32_t nightWakeUntil = 0;
+bool nightNow();
+const uint32_t NIGHT_WAKE_MS = 30000;
+
+// Previous firmware (the other OTA slot) for "switch back"; names kept in NVS
+String prevFwVersion;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -631,6 +649,80 @@ AlertKind classifyAlert(const LedConfig& lc, const WatchList& wl, const char* cs
   return ALERT_NONE;
 }
 
+// ---------------------------------------------------------------------------
+// Today's log: unique aircraft per hour, records and notable sightings.
+// Reset at local midnight; kept in RAM (starts over after a restart).
+// ---------------------------------------------------------------------------
+const int LOG_NOTABLE = 30;
+struct LogRecord { char cs[10] = ""; char type[6] = ""; int alt = 0; float kt = 0; double km = 0; time_t at = 0; };
+struct LogNotable { uint32_t hex; char cs[10]; char type[6]; AlertKind kind; time_t first; double km; int alt; };
+struct DayLog {
+  int yday = -1; time_t since = 0;
+  uint8_t seenBits[8192];           // 65536-bit Bloom filter of ICAO addresses (under 1% error)
+  uint32_t total = 0;
+  uint16_t hours[24];
+  LogRecord lowest, fastest, closest;
+  LogNotable notable[LOG_NOTABLE]; int nNotable = 0, moreNotable = 0;
+} dayLog;
+SemaphoreHandle_t logMutex = NULL;
+
+// Starts a poll: resets the log on a new local day. False until the clock is set.
+bool logBegin() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return false;
+  struct tm lt; localtime_r(&now, &lt);
+  if (lt.tm_yday != dayLog.yday) {
+    memset(dayLog.seenBits, 0, sizeof(dayLog.seenBits));
+    memset(dayLog.hours, 0, sizeof(dayLog.hours));
+    dayLog.total = 0; dayLog.nNotable = dayLog.moreNotable = 0;
+    dayLog.lowest = dayLog.fastest = dayLog.closest = LogRecord();
+    dayLog.since = dayLog.yday < 0 ? now : now - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec);
+    dayLog.yday = lt.tm_yday;
+  }
+  return true;
+}
+
+bool logSeenNew(uint32_t h) {
+  uint16_t a = (uint16_t)((h * 2654435761u) >> 16), b = (uint16_t)(((h ^ 0x5bd1e995u) * 0x9E3779B1u) >> 16);
+  bool seen = (dayLog.seenBits[a >> 3] & (1 << (a & 7))) && (dayLog.seenBits[b >> 3] & (1 << (b & 7)));
+  dayLog.seenBits[a >> 3] |= 1 << (a & 7); dayLog.seenBits[b >> 3] |= 1 << (b & 7);
+  return !seen;
+}
+
+void logRecord(LogRecord& r, const char* cs, const char* type, int alt, float kt, double km, time_t now) {
+  copyAscii(r.cs, cs, sizeof(r.cs)); copyAscii(r.type, type, sizeof(r.type));
+  r.alt = alt; r.kt = kt; r.km = km; r.at = now;
+}
+
+// One aircraft from the current poll (call with logMutex held)
+void logAircraft(const char* hexStr, const char* cs, const char* type, const char* category,
+                 uint8_t dbFlags, int alt, float kt, double km, const WatchList& wl) {
+  if (!hexStr[0]) return;
+  uint32_t hex = strtoul(hexStr[0] == '~' ? hexStr + 1 : hexStr, nullptr, 16) | (hexStr[0] == '~' ? 0x1000000u : 0);
+  time_t now = time(nullptr);
+  if (logSeenNew(hex)) {
+    struct tm lt; localtime_r(&now, &lt);
+    dayLog.total++;
+    dayLog.hours[lt.tm_hour]++;
+  }
+  if (alt > 0 && (!dayLog.lowest.at || alt < dayLog.lowest.alt)) logRecord(dayLog.lowest, cs, type, alt, kt, km, now);
+  if (!dayLog.fastest.at || kt > dayLog.fastest.kt) logRecord(dayLog.fastest, cs, type, alt, kt, km, now);
+  if (!dayLog.closest.at || km < dayLog.closest.km) logRecord(dayLog.closest, cs, type, alt, kt, km, now);
+
+  // Notable: watch list, military, government/rare, helicopters (regardless of LED settings)
+  LedConfig all; all.military = all.interesting = all.heli = true; all.lowAltFt = 0;
+  AlertKind k = classifyAlert(all, wl, cs, type, category, dbFlags, alt);
+  if (k == ALERT_NONE) return;
+  for (int i = 0; i < dayLog.nNotable; i++) {
+    LogNotable& n = dayLog.notable[i];
+    if (n.hex == hex) { if (km < n.km) { n.km = km; n.alt = alt; } return; }
+  }
+  if (dayLog.nNotable >= LOG_NOTABLE) { dayLog.moreNotable++; return; }
+  LogNotable& n = dayLog.notable[dayLog.nNotable++];
+  n.hex = hex; copyAscii(n.cs, cs[0] ? cs : "?", sizeof(n.cs)); copyAscii(n.type, type, sizeof(n.type));
+  n.kind = k; n.first = now; n.km = km; n.alt = alt;
+}
+
 // Fetches aircraft data into caller-provided local buffers (thread-safe — no globals touched)
 bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                      Aircraft& nearOut, Blip* blipsOut, uint8_t& blipCntOut,
@@ -681,6 +773,8 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   blipCntOut = 0;
   top5CntOut = 0;
 
+  bool logging = logMutex && logBegin();
+  if (logging) xSemaphoreTake(logMutex, portMAX_DELAY);
   for (JsonObject s : acList) {
     if (!s["lat"].is<double>() || !s["lon"].is<double>()) continue;
 
@@ -701,6 +795,7 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     copyAscii(category, s["category"] | "", sizeof(category));
     uint8_t dbFlags = s["dbFlags"] | 0;
     count++;
+    if (logging) logAircraft(s["hex"] | "", cs, type, category, dbFlags, altFt, gsKt, d, wl);
 
     // LED alerts: keep the highest-priority (then nearest) special aircraft in range
     if (lc.alerts && d <= alertKm) {
@@ -756,6 +851,7 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     }
   }
 
+  if (logging) xSemaphoreGive(logMutex);
   stats.inView = count; if (count > stats.maxInView) stats.maxInView = count;
   stats.requestsOk++;
 
@@ -776,7 +872,8 @@ bool fetchWeatherTo(Weather& w) {
 
   String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(hLat, 4) +
                "&longitude=" + String(hLon, 4) +
-               "&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,weather_code,pressure_msl";
+               "&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,weather_code,pressure_msl"
+               "&daily=sunrise,sunset&forecast_days=1&timezone=auto&timeformat=unixtime";
 #if UNITS_IMPERIAL
   url += "&temperature_unit=fahrenheit&wind_speed_unit=mph";
 #endif
@@ -791,6 +888,8 @@ bool fetchWeatherTo(Weather& w) {
   w.windDir = c["wind_direction_10m"] | 0;
   w.code = c["weather_code"] | 0;
   w.pressure = c["pressure_msl"] | 0.0f;
+  w.sunrise = doc["daily"]["sunrise"][0] | 0;
+  w.sunset = doc["daily"]["sunset"][0] | 0;
   w.valid = true;
   return true;
 }
@@ -1842,6 +1941,9 @@ void ledUpdate() {
     return;
   }
 
+  // Night mode: LED off
+  if (nightCfg.ledOff && nightNow()) { ledSet({0, 0, 0}, lc.brightness); return; }
+
   // New special aircraft in range -> blink 8 times in its color
   if (lc.alerts && al.kind != ALERT_NONE && !alreadyAlerted(al.callsign)) {
     blinkUntil = now + 8 * 2 * 150;
@@ -2011,9 +2113,38 @@ void connectWiFiAtBoot() {
 // ---------------------------------------------------------------------------
 // Touch
 // ---------------------------------------------------------------------------
+void applyBacklight(uint8_t pct) {
+  if (pct == backlightApplied) return;
+  backlightApplied = pct;
+  ledcWrite(BL_CH, (uint32_t)pct * 255 / 100);
+}
+
 void setBacklight(uint8_t pct) {
   backlightPct = pct;
-  ledcWrite(BL_CH, (uint32_t)pct * 255 / 100);
+  applyBacklight(pct);
+}
+
+// Is it night now, by the configured schedule or by today's sunset/sunrise?
+bool nightNow() {
+  time_t now = time(nullptr);
+  if (nightCfg.mode == 0 || now < 1700000000) return false;
+  if (nightCfg.mode == 2) {
+    uint32_t rise = weather.sunrise, set = weather.sunset;
+    if (!rise || !set) return false;
+    return (uint32_t)now < rise || (uint32_t)now >= set;
+  }
+  struct tm lt; localtime_r(&now, &lt);
+  int m = lt.tm_hour * 60 + lt.tm_min;
+  if (nightCfg.fromMin == nightCfg.toMin) return false;
+  return nightCfg.fromMin < nightCfg.toMin ? (m >= nightCfg.fromMin && m < nightCfg.toMin)
+                                           : (m >= nightCfg.fromMin || m < nightCfg.toMin);
+}
+
+// Screen is dimmed for the night right now (not woken by a tap)
+bool nightDimmed() { return nightCfg.level < backlightPct && nightNow() && !stillBefore(nightWakeUntil); }
+
+void nightUpdate() {
+  applyBacklight(nightDimmed() ? nightCfg.level : backlightPct);
 }
 
 // Raw touch reading: median of 5 samples, rejects light touches and SPI noise
@@ -2228,6 +2359,13 @@ void checkTouch() {
   if (millis() - lastTouchMs < 150) return;  // bounce
   lastTouchMs = millis();
 
+  // Night mode: a tap on the dimmed screen only wakes it
+  if (nightNow()) {
+    bool dimmed = nightDimmed();
+    nightWakeUntil = millis() + NIGHT_WAKE_MS;
+    if (dimmed) return;
+  }
+
   int sx, sy;
   mapTouch(rx, ry, sx, sy);
   Serial.printf("Touch: raw(%d,%d) -> screen(%d,%d)\n", rx, ry, sx, sy);
@@ -2369,6 +2507,26 @@ void setupArduinoOta() {
 }
 
 // ---------------------------------------------------------------------------
+// Previous firmware: the other OTA slot still holds the version before the last update
+// ---------------------------------------------------------------------------
+const esp_partition_t* previousFirmware() {
+  const esp_partition_t* run = esp_ota_get_running_partition();
+  const esp_partition_t* p = esp_ota_get_next_update_partition(nullptr);
+  esp_app_desc_t d;
+  if (!p || p == run || esp_ota_get_partition_description(p, &d) != ESP_OK) return nullptr;
+  return p;
+}
+
+// Makes the previous firmware boot next (the image is verified first). Caller restarts.
+bool switchToPreviousFirmware() {
+  const esp_partition_t* p = previousFirmware();
+  if (!p) return false;
+  esp_err_t e = esp_ota_set_boot_partition(p);
+  Serial.printf("Switch to previous firmware (%s): %s\n", p->label, esp_err_to_name(e));
+  return e == ESP_OK;
+}
+
+// ---------------------------------------------------------------------------
 // Web Server — Config Page
 // ---------------------------------------------------------------------------
 void initWebServer() {
@@ -2380,6 +2538,12 @@ void initWebServer() {
     lc = ledCfg;
     if (configMutex) xSemaphoreGive(configMutex);
     auto chk = [](bool b) { return b ? String(" checked") : String(""); };
+    auto hhmm = [](uint16_t m) { char b[8]; snprintf(b, sizeof(b), "%02u:%02u", (m / 60) % 24, m % 60); return String(b); };
+    auto sel = [](bool b) { return b ? String(" selected") : String(""); };
+    String rollback = previousFirmware()
+        ? String("<button type=\"button\" class=\"opt\" style=\"text-align:center\" onclick=\"rollback()\">Switch back to ") +
+          (prevFwVersion.length() ? prevFwVersion : String("the previous firmware")) + "</button>"
+        : String("");
     name.replace("&", "&amp;"); name.replace("\"", "&quot;"); name.replace("<", "&lt;");
     String ssid = WiFi.SSID();
     ssid.replace("&", "&amp;"); ssid.replace("<", "&lt;");
@@ -2456,6 +2620,30 @@ void initWebServer() {
   <button type="button" class="opt" style="text-align:center" onclick="post('/led-test','')">Test LED</button>
 </div>
 <div class="card">
+  <h2>Today</h2>
+  <div id="td" style="font-size:0.9em;color:#aaa">Loading...</div>
+  <div id="tdh" style="display:flex;align-items:flex-end;gap:2px;height:60px;margin-top:10px"></div>
+  <div style="display:flex;justify-content:space-between;color:#777;font-size:0.7em"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>
+  <div id="tdr" style="font-size:0.9em;margin-top:10px"></div>
+  <div id="tdn" style="font-size:0.9em;margin-top:10px"></div>
+</div>
+<div class="card">
+  <h2>Night mode</h2>
+  <label>Dim the screen</label>
+  <select id="nm" style="width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em">
+    <option value="0")rawliteral" + sel(nightCfg.mode == 0) + R"rawliteral(>Off</option>
+    <option value="1")rawliteral" + sel(nightCfg.mode == 1) + R"rawliteral(>On a schedule</option>
+    <option value="2")rawliteral" + sel(nightCfg.mode == 2) + R"rawliteral(>From sunset to sunrise</option>
+  </select>
+  <div class="row" style="margin-top:4px"><div style="flex:1"><label>From</label><input type="time" id="nf" value=")rawliteral" + hhmm(nightCfg.fromMin) + R"rawliteral("></div>
+  <div style="flex:1"><label>To</label><input type="time" id="nt" value=")rawliteral" + hhmm(nightCfg.toMin) + R"rawliteral("></div></div>
+  <label>Night brightness: <span id="nlv">)rawliteral" + String(nightCfg.level) + R"rawliteral(</span>% (0 = screen off)</label>
+  <input type="range" min="0" max="100" step="5" id="nl" value=")rawliteral" + String(nightCfg.level) + R"rawliteral(" style="padding:0" oninput="$('nlv').textContent=this.value">
+  <label class="chk"><input type="checkbox" id="nled")rawliteral" + chk(nightCfg.ledOff) + R"rawliteral(> Back LED off at night</label>
+  <div class="hint">A tap wakes the screen for 30 seconds.</div>
+  <button type="button" onclick="saveNight()">Save night mode</button>
+</div>
+<div class="card">
   <h2>Firmware</h2>
   <div style="font-size:0.9em;color:#aaa">Version <b>)rawliteral" + String(FW_VERSION) + R"rawliteral(</b>, build <b>)rawliteral" + String(BUILD_ENV) + R"rawliteral(</b>. Upload <code>firmware.bin</code> or <code>*-merged.bin</code> from the <b>)rawliteral" + String(BUILD_ENV) + R"rawliteral(</b> build on GitHub.</div>
   <input type="file" id="fw" accept=".bin" style="margin-top:12px">
@@ -2463,6 +2651,7 @@ void initWebServer() {
   <div id="gh" style="font-size:0.9em;color:#aaa;margin-top:12px">Checking GitHub...</div>
   <button type="button" id="ghi" style="display:none" onclick="ghInstall()">Install from GitHub</button>
   <button type="button" class="opt" style="text-align:center" onclick="ghCheck()">Check for updates</button>
+  )rawliteral" + rollback + R"rawliteral(
   <div class="hint" style="margin-top:14px">Or upload a file:</div>
   <div id="fws" class="hint"></div>
   <button type="button" onclick="upload()">Update firmware</button>
@@ -2549,6 +2738,33 @@ function ghInstall(){
   post('/update-github','',function(x){if(x.status!=200){flash(x.responseText);return}ghBusy=true;setTimeout(ghPoll,1000)});
 }
 ghPoll();
+function saveNight(){
+  var t=function(i){var v=$(i).value.split(':');return (+v[0])*60+(+v[1]||0)};
+  post('/night','m='+$('nm').value+'&f='+t('nf')+'&t='+t('nt')+'&l='+$('nl').value+'&led='+($('nled').checked?1:0),
+    function(x){flash(x.status==200?'✓ Night mode saved!':x.responseText)});
+}
+function rollback(){
+  if(!confirm('Restart into the previous firmware? Settings are kept.'))return;
+  post('/rollback','',function(x){if(x.status==200){flash('Restarting...');setTimeout(function(){location.reload()},15000)}else flash(x.responseText)});
+}
+function esc(t){return String(t).replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c]})}
+function today(){
+  fetch('/today').then(function(x){return x.json()}).then(function(d){
+    if(!d.ok){$('td').textContent='Waiting for the clock and the first data...';return}
+    $('td').innerHTML='<b style="color:#fff;font-size:1.4em">'+d.total+'</b> aircraft since '+d.since;
+    var mx=Math.max.apply(null,d.hours.concat([1])),h='';
+    d.hours.forEach(function(v,i){h+='<div title="'+i+':00 - '+v+'" style="flex:1;background:'+(i==d.hour?'#00c8ff':'#1f6f9f')+';height:'+Math.max(2,v*100/mx)+'%"></div>'});
+    $('tdh').innerHTML=h;
+    var r=function(n,o,v){return o?'<div>'+n+': <b>'+esc(o.cs)+'</b> '+esc(o.t)+' &middot; '+v+' <span style="color:#777">'+o.at+'</span></div>':''};
+    $('tdr').innerHTML=r('Lowest',d.low,d.low&&d.low.alt+' ft')+r('Fastest',d.fast,d.fast&&d.fast.kt+' kt')+
+      r('Closest',d.close,d.close&&d.close.d+' '+d.unit);
+    var n=d.notable.map(function(a){return '<div><span style="color:#777">'+a.at+'</span> <b>'+esc(a.cs)+'</b> '+esc(a.t)+
+      ' <span class="dot" style="background:'+a.c+'"></span> '+esc(a.k)+' &middot; '+a.d+' '+d.unit+'</div>'}).join('');
+    if(d.more)n+='<div class="hint">and '+d.more+' more</div>';
+    $('tdn').innerHTML=n?'<div style="color:#aaa;margin-bottom:4px">Notable</div>'+n:'';
+  }).catch(function(){$('td').textContent='Could not load'});
+}
+today();setInterval(today,60000);
 function forget(){
   if(!confirm('Forget the saved WiFi network and restart into setup mode?'))return;
   var x=new XMLHttpRequest();x.open('POST','/wifi-reset',true);x.send();
@@ -2689,6 +2905,66 @@ function forget(){
     server.send(200, "text/plain", "OK");
   });
 
+  // POST /night — night mode settings
+  server.on("/night", HTTP_POST, []() {
+    int m = server.arg("m").toInt(), f = server.arg("f").toInt(), t = server.arg("t").toInt(), l = server.arg("l").toInt();
+    if (m < 0 || m > 2 || f < 0 || f >= 1440 || t < 0 || t >= 1440 || l < 0 || l > 100) {
+      server.send(400, "text/plain", "Invalid values"); return;
+    }
+    nightCfg.mode = m; nightCfg.fromMin = f; nightCfg.toMin = t; nightCfg.level = l;
+    nightCfg.ledOff = server.arg("led") == "1";
+    prefs.putUChar("night_mode", nightCfg.mode);
+    prefs.putUShort("night_from", nightCfg.fromMin);
+    prefs.putUShort("night_to", nightCfg.toMin);
+    prefs.putUChar("night_lvl", nightCfg.level);
+    prefs.putBool("night_led", nightCfg.ledOff);
+    server.send(200, "text/plain", "OK");
+  });
+
+  // GET /today — today's log as JSON
+  server.on("/today", HTTP_GET, []() {
+    auto hm = [](time_t t) { char b[6]; struct tm lt; localtime_r(&t, &lt); strftime(b, sizeof(b), "%H:%M", &lt); return String(b); };
+    JsonDocument d;
+    if (logMutex) xSemaphoreTake(logMutex, portMAX_DELAY);
+    d["ok"] = dayLog.yday >= 0;
+    if (dayLog.yday >= 0) {
+      time_t now = time(nullptr); struct tm lt; localtime_r(&now, &lt);
+      d["total"] = dayLog.total; d["since"] = hm(dayLog.since); d["hour"] = lt.tm_hour;
+      d["unit"] = DIST_UNIT;
+      JsonArray h = d["hours"].to<JsonArray>();
+      for (int i = 0; i < 24; i++) h.add(dayLog.hours[i]);
+      auto rec = [&](const char* key, const LogRecord& r) {
+        if (!r.at) return;
+        JsonObject o = d[key].to<JsonObject>();
+        o["cs"] = r.cs[0] ? r.cs : "?"; o["t"] = r.type; o["alt"] = r.alt; o["kt"] = (int)lroundf(r.kt);
+        o["d"] = serialized(String(r.km / KM_PER_UNIT, 1)); o["at"] = hm(r.at);
+      };
+      rec("low", dayLog.lowest); rec("fast", dayLog.fastest); rec("close", dayLog.closest);
+      JsonArray n = d["notable"].to<JsonArray>();
+      for (int i = dayLog.nNotable - 1; i >= 0; i--) {     // newest first
+        const LogNotable& a = dayLog.notable[i];
+        JsonObject o = n.add<JsonObject>();
+        o["cs"] = a.cs; o["t"] = a.type; o["k"] = alertName(a.kind); o["at"] = hm(a.first);
+        o["d"] = serialized(String(a.km / KM_PER_UNIT, 1));
+        RGB c = alertColor(a.kind); char hex[8]; snprintf(hex, sizeof(hex), "#%02x%02x%02x", c.r, c.g, c.b);
+        o["c"] = hex;
+      }
+      d["more"] = dayLog.moreNotable;
+    }
+    if (logMutex) xSemaphoreGive(logMutex);
+    String out; serializeJson(d, out);
+    server.send(200, "application/json", out);
+  });
+
+  // POST /rollback — restart into the firmware in the other OTA slot
+  server.on("/rollback", HTTP_POST, []() {
+    if (!switchToPreviousFirmware()) { server.send(500, "text/plain", "No valid previous firmware"); return; }
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/plain", "OK");
+    delay(1000);
+    ESP.restart();
+  });
+
   // POST /calibrate — run touch calibration on the device
   server.on("/calibrate", HTTP_POST, []() {
     calibrateRequested = true;
@@ -2717,6 +2993,7 @@ void setup() {
   // Mutexes first: setLocation() may run during WiFi setup
   dataMutex = xSemaphoreCreateMutex();
   configMutex = xSemaphoreCreateMutex();
+  logMutex = xSemaphoreCreateMutex();
 
   touchSpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, -1);
   ts.begin(touchSpi);
@@ -2760,6 +3037,32 @@ void setup() {
   // Load persisted config (or use defaults) before WiFi setup, which may change the location.
   // New keys: older firmware stored the radius in degrees and the range in km.
   prefs.begin("cyd-spotter", false);
+
+  // Firmware history: remember the version that ran before this one ("switch back" label)
+  String fwCur = prefs.isKey("fw_cur") ? prefs.getString("fw_cur") : String("");
+  if (fwCur != FW_VERSION) {
+    if (fwCur.length()) prefs.putString("fw_prev", fwCur);
+    prefs.putString("fw_cur", FW_VERSION);
+  }
+  if (prefs.isKey("fw_prev")) prevFwVersion = prefs.getString("fw_prev");
+
+  // Crash-loop guard: 3 crashes in a row within a minute of boot -> back to the previous firmware
+  esp_reset_reason_t rr = esp_reset_reason();
+  bool crashed = rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT;
+  uint8_t bootFails = crashed ? prefs.getUChar("bootfail", 0) + 1 : 0;
+  prefs.putUChar("bootfail", bootFails);
+  if (bootFails >= 3) {
+    prefs.putUChar("bootfail", 0);
+    Serial.printf("Crashed %u times in a row after boot\n", bootFails);
+    if (switchToPreviousFirmware()) {
+      tft.fillScreen(TFT_BLACK); tft.setTextFont(4); tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+      tft.drawString("Firmware keeps crashing", 10, 90);
+      tft.drawString("Going back to the", 10, 120);
+      tft.drawString("previous version...", 10, 150);
+      delay(3000);
+      ESP.restart();
+    }
+  }
   // Read only keys that exist: the ESP32 Preferences library logs an error for
   // every missing key, which floods the serial log on first boot.
   #define PREF(key, getter, var) if (prefs.isKey(key)) var = prefs.getter(key, var)
@@ -2784,6 +3087,11 @@ void setup() {
   if (prefs.isKey("led_watch")) copyAscii(ledCfg.watch, prefs.getString("led_watch").c_str(), sizeof(ledCfg.watch));
   PREF("bl", getUChar, backlightPct);
   PREF("navbtn", getBool, navButtons);
+  PREF("night_mode", getUChar, nightCfg.mode);
+  PREF("night_from", getUShort, nightCfg.fromMin);
+  PREF("night_to", getUShort, nightCfg.toMin);
+  PREF("night_lvl", getUChar, nightCfg.level);
+  PREF("night_led", getBool, nightCfg.ledOff);
   #undef PREF
   ledInit();
 
@@ -2834,7 +3142,12 @@ void loop() {
   ArduinoOTA.handle();
   if (otaActive) { delay(5); return; }   // OTA screen owns the display
 
+  // Crash-loop guard: a minute of normal running clears the crash counter
+  static bool bootOk = false;
+  if (!bootOk && millis() > 60000) { bootOk = true; if (prefs.getUChar("bootfail", 0)) prefs.putUChar("bootfail", 0); }
+
   checkTouch();
+  nightUpdate();
   render();
   updateNavOverlay();
   ledUpdate();
