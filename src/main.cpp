@@ -1583,12 +1583,13 @@ void screenWeatherSystem(bool newPage) {
     tft.drawString(fitPx(lastFetchErr, 90), 118, 225);
   }
 
-  tft.fillRect(250, 198, 62, 30, C_PANEL);
+  tft.fillRect(248, 198, 64, 30, C_PANEL);
   tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE, C_PANEL);
   if (!lastOkMs) snprintf(buf, sizeof(buf), "--");
   else if (ago < 120) snprintf(buf, sizeof(buf), "%lus ago", (unsigned long)ago);
-  else snprintf(buf, sizeof(buf), "%lum ago", (unsigned long)(ago / 60));
-  tft.drawString(fitPx(buf, 62), 250, 203);
+  else if (ago < 7200) snprintf(buf, sizeof(buf), "%lum ago", (unsigned long)(ago / 60));
+  else snprintf(buf, sizeof(buf), "%luh ago", (unsigned long)(ago / 3600));
+  tft.drawString(fitPx(buf, 64), 248, 203);
   tft.setTextFont(2);
 }
 
