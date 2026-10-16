@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build the release for
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        env: [cyd, cyd-alt, cyd2usb]
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build ${{ matrix.env }}
+        run: |
+          set -o pipefail
+          export PLATFORMIO_BUILD_FLAGS="-DFW_VERSION=\\\"${TAG}\\\""
+          pio run -e ${{ matrix.env }} 2>&1 | tee build.log
+          grep -E "^(RAM|Flash):" build.log | while read -r l; do echo "::notice title=${{ matrix.env }} size::$l"; done
+
+      - name: Package images
+        run: |
+          B=.pio/build/${{ matrix.env }}
+          BOOT_APP0=$(find ~/.platformio/packages/framework-arduinoespressif32 -name boot_app0.bin | head -1)
+          mkdir -p dist
+          pio pkg exec -p tool-esptoolpy -- esptool.py --chip esp32 merge_bin \
+            -o dist/${{ matrix.env }}-merged.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000 $B/bootloader.bin \
+            0x8000 $B/partitions.bin \
+            0xe000 "$BOOT_APP0" \
+            0x10000 $B/firmware.bin
+          cp $B/firmware.bin dist/${{ matrix.env }}-firmware.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.env }}
+          path: dist/*.bin
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write release notes
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Which file do I need?
+
+          | Board | Panel | First flash over USB (offset `0x0`) | Update over WiFi |
+          |-------|-------|------------------------------------|------------------|
+          | ESP32-2432S028R, one micro-USB | ILI9341 | `cyd-merged.bin` | `cyd-firmware.bin` |
+          | micro-USB + USB-C, panel label HSD028309 | ILI9341 | `cyd-alt-merged.bin` | `cyd-alt-firmware.bin` |
+          | "CYD2USB", micro-USB + USB-C | ST7789 | `cyd2usb-merged.bin` | `cyd2usb-firmware.bin` |
+
+          At power-on the screen flashes red, green and blue when the build matches the panel; if it stays white or black, try another build.
+
+          - **First flash:** open [ESP Tool](https://espressif.github.io/esptool-js/) in Chrome or Edge, connect the board, flash `<env>-merged.bin` at `0x0`. This erases saved settings.
+          - **Update:** open `http://planespotter.local`, *Firmware* card, upload `<env>-firmware.bin`. WiFi, location and calibration are kept.
+          NOTES
+          echo "" >> notes.md
+          prev=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -1 || true)
+          if [ -n "$prev" ]; then
+            echo "**Full changelog:** https://github.com/${{ github.repository }}/compare/${prev}...${TAG}" >> notes.md
+          fi
+
+      - name: Publish release
+        run: |
+          ls -l dist
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.bin --clobber
+          else
+            gh release create "$TAG" dist/*.bin --title "$TAG" --notes-file notes.md
+          fi

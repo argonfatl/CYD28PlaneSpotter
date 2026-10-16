@@ -2,9 +2,10 @@
  * CYD28 (ESP32) Plane Spotter - Direct TFT Rendering
  * --------------------------------------------------------------------------
  * Data sources (no API keys needed):
- *   - airplanes.live  : live ADS-B aircraft around a point
- *   - adsbdb.com      : callsign -> airline + route (origin/destination)
- *   - Open-Meteo      : current weather
+ *   - airplanes.live, adsb.lol, adsb.fi : live ADS-B aircraft (tried in turn)
+ *   - adsbdb.com      : callsign -> airline + route, ICAO hex -> aircraft model
+ *   - Open-Meteo      : current weather and city search
+ *   - ip-api.com      : approximate location from the public IP
  * All network I/O runs in a FreeRTOS task on Core 0; Core 1 only draws.
  */
 
@@ -22,7 +23,6 @@
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include <cydqr.h>
-#include <new>
 #include <math.h>
 #include <algorithm>
 #include <time.h>
@@ -94,14 +94,14 @@
   #define TEMP_UNIT "F"
   #define WIND_UNIT "mph"
   static const double KM_PER_UNIT = 1.609344;
-  static const float  RANGE_STEP = 5, RANGE_MIN = 5, RANGE_MAX = 150;
+  static const float  RANGE_MIN = 5, RANGE_MAX = 150;
   static const float  DEFAULT_ALERT_RANGE = 3;
 #else
   #define DIST_UNIT "km"
   #define TEMP_UNIT "C"
   #define WIND_UNIT "km/h"
   static const double KM_PER_UNIT = 1.0;
-  static const float  RANGE_STEP = 10, RANGE_MIN = 10, RANGE_MAX = 250;
+  static const float  RANGE_MIN = 10, RANGE_MAX = 250;
   static const float  DEFAULT_ALERT_RANGE = 5;
 #endif
 static const float MAX_SEARCH_NM = 250;   // airplanes.live point-query limit
@@ -120,6 +120,7 @@ volatile bool refreshRequested = false;   // skip the rest of the poll wait
 volatile bool ipLocateRequested = false;  // "Locate by IP" button
 char statusMsg[48] = "";                  // one-line feedback on the settings screen
 volatile bool otaActive = false;          // firmware update in progress: pause fetching/drawing
+volatile bool portalActive = false;       // WiFi setup portal running: pause fetching
 
 // ---- Back RGB LED (CYD: R=GPIO4, G=GPIO16, B=GPIO17, common anode = active LOW) ----
 #define LED_PIN_R 4
@@ -211,7 +212,6 @@ uint32_t lastDataMs = 0;
 // Async data fetch (FreeRTOS task on Core 0)
 SemaphoreHandle_t dataMutex = NULL;
 TaskHandle_t fetchTaskHandle = NULL;
-volatile bool newDataReady = false;
 
 // Route Cache
 const uint8_t ROUTE_CACHE_SIZE = 15;
@@ -231,12 +231,11 @@ struct Weather {
 struct Stats {
   uint32_t requestsOk = 0; uint32_t requestsFail = 0;
   uint16_t inView = 0; uint16_t maxInView = 0;
-  double closestEver = 1e9; uint32_t lastUpdateMs = 0;
+  uint32_t lastUpdateMs = 0;
 } stats;
 
 uint8_t screen = 0;
 uint8_t lastScreen = 255;
-uint32_t lastScreenSwap = 0;
 uint32_t lastTouchMs = 0;
 uint32_t wifiConfirmUntil = 0;   // "WiFi setup" needs a second tap within 3 s
 volatile bool portalRequested = false;
@@ -257,7 +256,6 @@ float touchCal[6] = {0.0f, -0.086486f, 337.30f,    // sx = a*rx + b*ry + c
 // Screen backlight (GPIO21) via LEDC channel 0
 #define BL_CH 0
 uint8_t backlightPct = 100;
-const uint32_t SCREEN_SWAP_MS = 10000;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -566,37 +564,6 @@ void getAircraftModel(Aircraft& a) {
   if (!a.airline[0]) strcpy(a.airline, c.owner);
 }
 
-// GET a URL into a newly allocated buffer (caller frees). Returns length, 0 on failure.
-size_t httpGetBytes(const String& url, uint8_t** out, size_t maxLen) {
-  *out = nullptr;
-  WiFiClientSecure client; client.setInsecure();
-  HTTPClient http;
-  http.useHTTP10(true);
-  http.setTimeout(15000);
-  http.setUserAgent("CYD28PlaneSpotter/1.2 (+https://github.com/argonfatl/CYD28PlaneSpotter)");
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  if (!http.begin(client, url)) return 0;
-  int code = http.GET();
-  int size = http.getSize();
-  if (code != HTTP_CODE_OK || size <= 0 || (size_t)size > maxLen) {
-    Serial.printf("Download: HTTP %d, size %d: %s\n", code, size, url.c_str());
-    http.end(); return 0;
-  }
-  uint8_t* buf = (uint8_t*)malloc(size);
-  if (!buf) { http.end(); return 0; }
-  WiFiClient* st = http.getStreamPtr();
-  size_t got = 0; uint32_t t0 = millis();
-  while (got < (size_t)size && millis() - t0 < 15000) {
-    int n = st->read(buf + got, size - got);
-    if (n > 0) got += n; else delay(5);
-  }
-  http.end();
-  if (got != (size_t)size) { free(buf); return 0; }
-  *out = buf;
-  return got;
-}
-
-
 // Aircraft data sources (all free, keyless, readsb JSON format), tried in order
 struct Source { const char* name; const char* fmt; };
 const Source SOURCES[] = {
@@ -778,8 +745,6 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
 
   if (top5CntOut > 0) {
     nearOut = top5Out[0];
-    if (nearOut.distanceKm < stats.closestEver)
-      stats.closestEver = nearOut.distanceKm;
   } else {
     nearOut.valid = false;
   }
@@ -831,7 +796,7 @@ void dataFetcherTask(void* param) {
   bool weatherDone = false;
 
   for (;;) {
-    if (otaActive) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+    if (otaActive || portalActive) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
     refreshRequested = false;
     if (WiFi.status() == WL_CONNECTED) {
       // "Locate by IP" from the settings screen
@@ -872,7 +837,6 @@ void dataFetcherTask(void* param) {
         if (locAlert.kind != ALERT_NONE) { lastAlert = locAlert; lastAlertMs = millis(); }
         lastDataMs = millis();
         stats.lastUpdateMs = lastDataMs;
-        newDataReady = true;
         xSemaphoreGive(dataMutex);
 
       }
@@ -892,6 +856,9 @@ void dataFetcherTask(void* param) {
 // ---------------------------------------------------------------------------
 // UI & Drawing
 // ---------------------------------------------------------------------------
+// True until the deadline passes; safe across the 49-day millis() rollover
+bool stillBefore(uint32_t deadline) { return deadline && (int32_t)(deadline - millis()) > 0; }
+
 bool timeReady() { return time(nullptr) > 1700000000; }
 void fmtClock(char* buf, size_t n, bool withSecs) {
   if (!timeReady()) { strncpy(buf, withSecs ? "--:--:--" : "--:--", n); return; }
@@ -1160,7 +1127,7 @@ void drawHeader(const char* title, bool newPage) {
 // Selected aircraft if one was tapped recently and is still in the top 5, else nearest
 const Aircraft* targetAircraft(bool* isSelected = nullptr) {
   if (isSelected) *isSelected = false;
-  if (selectedCs[0] && millis() < selectedUntil) {
+  if (selectedCs[0] && stillBefore(selectedUntil)) {
     for (int i = 0; i < top5Count; i++)
       if (strcmp(top5[i].callsign, selectedCs) == 0) {
         if (isSelected) *isSelected = i != 0;
@@ -1642,7 +1609,7 @@ void screenSettings(bool newPage) {
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
   strcpy(name, homeName); ledAlerts = ledCfg.alerts;
   if (configMutex) xSemaphoreGive(configMutex);
-  bool wifiArmed = millis() < wifiConfirmUntil, online = WiFi.status() == WL_CONNECTED;
+  bool wifiArmed = stillBefore(wifiConfirmUntil), online = WiFi.status() == WL_CONNECTED;
 
   // Redraw when anything shown on the cards changes
   static uint32_t lastKey = 0xFFFFFFFF;
@@ -1889,6 +1856,8 @@ bool runWifiPortal(bool onDemand) {
 
   bool ok;
   if (onDemand) {
+    portalActive = true;           // no HTTPS requests while the WiFi mode changes
+    delay(300);
     server.stop();                 // the portal needs port 80
     drawPortalScreen(nullptr);
     ok = wm.startConfigPortal(SETUP_AP_NAME);
@@ -1904,7 +1873,7 @@ bool runWifiPortal(bool onDemand) {
     if (applyLocationInput(locParam.getValue())) setStatus("Location updated");
     else setStatus("WiFi saved");
   }
-  if (onDemand) server.begin();
+  if (onDemand) { server.begin(); portalActive = false; refreshRequested = true; }
 
   tft.fillScreen(TFT_BLACK);
   lastScreen = 255;   // full redraw of the current page
@@ -1940,15 +1909,6 @@ void connectWiFiAtBoot() {
 // ---------------------------------------------------------------------------
 // Touch
 // ---------------------------------------------------------------------------
-void changeRange(float delta) {
-  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
-  radarRange = constrain(radarRange + delta, RANGE_MIN, RANGE_MAX);
-  float r = radarRange;
-  prefs.putFloat("range_u", r);
-  if (configMutex) xSemaphoreGive(configMutex);
-  Serial.printf("Radar range: %d %s\n", (int)r, DIST_UNIT);
-}
-
 void setBacklight(uint8_t pct) {
   backlightPct = pct;
   ledcWrite(BL_CH, (uint32_t)pct * 255 / 100);
@@ -2087,7 +2047,7 @@ void handleMenuButton(int b) {
   switch (b) {
     case MB_WIFI:
       // WiFi setup interrupts tracking, so it needs a confirming second tap
-      if (millis() < wifiConfirmUntil) { wifiConfirmUntil = 0; portalRequested = true; }
+      if (stillBefore(wifiConfirmUntil)) { wifiConfirmUntil = 0; portalRequested = true; }
       else wifiConfirmUntil = millis() + 3000;
       break;
     case MB_LOCATE:
@@ -2122,7 +2082,7 @@ void handleMenuButton(int b) {
 
 // ---- On-screen navigation arrows ----
 const int NAV_Y = 95, NAV_H = 50, NAV_W = 36;
-bool navVisible() { return navButtons && screen != SCREEN_SETTINGS && millis() < navShownUntil; }
+bool navVisible() { return navButtons && screen != SCREEN_SETTINGS && stillBefore(navShownUntil); }
 
 void drawNavArrow(int x, bool right) {
   tft.fillRoundRect(x, NAV_Y, NAV_W, NAV_H, 8, C_BLUEB);
@@ -2168,6 +2128,14 @@ void checkTouch() {
     return;                                  // taps elsewhere on the menu do nothing
   }
 
+  // Visible navigation arrows come first: they are drawn over the page
+  bool arrowsShown = navVisible();
+  if (arrowsShown && sy >= NAV_Y - 15 && sy < NAV_Y + NAV_H + 15) {
+    if (sx < NAV_W + 20)        { navShownUntil = millis() + NAV_TIMEOUT_MS; screen = (screen + NUM_SCREENS - 1) % NUM_SCREENS; return; }
+    if (sx >= 320 - NAV_W - 20) { navShownUntil = millis() + NAV_TIMEOUT_MS; screen = (screen + 1) % NUM_SCREENS; return; }
+  }
+  if (navButtons) navShownUntil = millis() + NAV_TIMEOUT_MS;
+
   // Radar screen: range preset buttons on the left
   if (screen == 2 && sx < RB_X + RB_W + 6 && sy >= RB_Y - 3) {
     int k = constrain((sy - RB_Y + 3) / RB_STEP, 0, 3);
@@ -2180,7 +2148,7 @@ void checkTouch() {
 
   // Traffic screen: tap a row to show that aircraft on the first page
   // (the header strip and empty space below the rows still flip to the next page)
-  if (screen == 1 && sy >= TR_Y && !navVisible()) {
+  if (screen == 1 && sy >= TR_Y) {
     int row = (sy - TR_Y) / TR_STEP;
     if (row < top5Count && sy - TR_Y - row * TR_STEP <= TR_H) {
       if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -2192,20 +2160,11 @@ void checkTouch() {
     }
   }
 
-  // Navigation arrows mode: a tap shows the arrows; only the arrows switch pages
-  if (navButtons) {
-    bool shown = navVisible();
-    navShownUntil = millis() + NAV_TIMEOUT_MS;
-    if (shown && sy >= NAV_Y - 15 && sy < NAV_Y + NAV_H + 15) {
-      if (sx < NAV_W + 20)        { screen = (screen + NUM_SCREENS - 1) % NUM_SCREENS; return; }
-      if (sx >= 320 - NAV_W - 20) { screen = (screen + 1) % NUM_SCREENS; return; }
-    }
-    return;
-  }
+  // Navigation arrows mode: other taps only show the arrows; only the arrows switch pages
+  if (navButtons) return;
 
   // Anywhere else: next screen
   screen = (screen + 1) % NUM_SCREENS;
-  lastScreenSwap = millis();
 }
 
 // ---------------------------------------------------------------------------
@@ -2314,21 +2273,21 @@ void initWebServer() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>CYD Plane Spotter</title>
 <style>
-  body{font-family:Arial,sans-serif;background:#0a0a1a;color:#e0e0e0;margin:0;padding:20px}
-  h1{color:#00ff88;text-align:center;font-size:1.4em}
-  h2{color:#00ff88;font-size:1em;margin:0 0 8px}
-  .card{background:#1a1a2e;border-radius:12px;padding:20px;margin:12px 0;max-width:420px;margin-left:auto;margin-right:auto}
+  body{font-family:Arial,sans-serif;background:#0a1520;color:#e0e0e0;margin:0;padding:20px}
+  h1{color:#00c8ff;text-align:center;font-size:1.4em}
+  h2{color:#00c8ff;font-size:1em;margin:0 0 8px}
+  .card{background:#0e1c2b;border-radius:12px;padding:20px;margin:12px 0;max-width:420px;margin-left:auto;margin-right:auto}
   label{display:block;margin:10px 0 4px;color:#aaa;font-size:0.85em}
-  input{width:100%;padding:10px;border:1px solid #333;border-radius:6px;background:#0d0d1f;color:#fff;font-size:1em;box-sizing:border-box}
-  input:focus{border-color:#00ff88;outline:none}
-  button{width:100%;padding:12px;margin-top:16px;background:#00ff88;color:#000;border:none;border-radius:8px;font-size:1.1em;font-weight:bold;cursor:pointer}
-  button:hover{background:#00cc6a}
+  input{width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em;box-sizing:border-box}
+  input:focus{border-color:#00c8ff;outline:none}
+  button{width:100%;padding:12px;margin-top:16px;background:#00c8ff;color:#000;border:none;border-radius:8px;font-size:1.1em;font-weight:bold;cursor:pointer}
+  button:hover{background:#00a8d8}
   .row{display:flex;gap:8px}.row input{flex:1}.row button{width:auto;margin-top:0;padding:10px 16px}
-  .opt{background:#0d0d1f;color:#e0e0e0;border:1px solid #333;font-weight:normal;font-size:0.95em;margin-top:6px;text-align:left}
-  .opt:hover{background:#22223a}
+  .opt{background:#08111b;color:#e0e0e0;border:1px solid #1f3b57;font-weight:normal;font-size:0.95em;margin-top:6px;text-align:left}
+  .opt:hover{background:#16283a}
   .danger{background:#3a1a1a;color:#ff8080}.danger:hover{background:#552222}
   .info{text-align:center;color:#666;font-size:0.8em;margin-top:12px}
-  .msg{color:#00ff88;text-align:center;display:none;position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#1a1a2e;border:1px solid #00ff88;padding:10px 18px;border-radius:8px}
+  .msg{color:#00c8ff;text-align:center;display:none;position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#0e1c2b;border:1px solid #00c8ff;padding:10px 18px;border-radius:8px}
   #res{font-size:0.9em;color:#aaa;margin-top:6px}
   .chk{display:flex;align-items:center;gap:10px;margin:10px 0;color:#e0e0e0;font-size:0.95em}
   .chk input{width:auto;margin:0}
@@ -2678,7 +2637,6 @@ void setup() {
   setenv("TZ", TIMEZONE, 1); tzset();
 
   nearest.valid = false;
-  newDataReady = false;
 
   initWebServer();
   setupArduinoOta();
@@ -2687,7 +2645,7 @@ void setup() {
   xTaskCreatePinnedToCore(
     dataFetcherTask,   // Function
     "DataFetch",       // Name
-    20480,             // Stack (20 KB — JSON + SSL + logo download)
+    20480,             // Stack (20 KB — JSON parsing + TLS)
     NULL,              // Parameter
     1,                 // Priority
     &fetchTaskHandle,  // Handle
