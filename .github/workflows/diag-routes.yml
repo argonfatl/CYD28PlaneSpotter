@@ -34,7 +34,16 @@ jobs:
               if (p.get('gs',0) or 0)>50 and ad(t,brg(p['lat'],p['lon'],*d))>100 and ad(t,brg(p['lat'],p['lon'],*o))<80: return -1
               return 1
           out=[]
-          ac=[a for a in get("https://api.airplanes.live/v2/point/41.88/-88.0078/25")["ac"] if a.get("flight","").strip() and isinstance(a.get("alt_baro"),int) and "lat" in a]
+          import traceback
+          src=None
+          for u in ["https://api.airplanes.live/v2/point/41.88/-88.0078/25","https://api.adsb.lol/v2/point/41.88/-88.0078/25","https://opendata.adsb.fi/api/v3/lat/41.88/lon/-88.0078/dist/25"]:
+              try:
+                  src=get(u); out.append("source "+u); break
+              except Exception as e:
+                  out.append(f"source {u} failed: {e}")
+          if src is None:
+              print("::notice title=routes::"+"%0A".join(out)); raise SystemExit(0)
+          ac=[a for a in (src.get("ac") or src.get("aircraft") or []) if a.get("flight","").strip() and isinstance(a.get("alt_baro"),int) and "lat" in a]
           ac.sort(key=lambda a: hav(41.88,-88.0078,a["lat"],a["lon"]))
           ac=ac[:15]
           body=json.dumps({"planes":[{"callsign":a["flight"].strip(),"lat":a["lat"],"lng":a["lon"]} for a in ac]}).encode()
@@ -48,6 +57,7 @@ jobs:
               cs=a["flight"].strip(); line=f"{cs:8} alt {a['alt_baro']:>6} vr {a.get('baro_rate',a.get('geom_rate',0)) or 0:>6} trk {int(a.get('track',0) or 0):>3} | "
               try:
                   j=get(f"https://api.adsbdb.com/v0/callsign/{cs}")
+                  if not isinstance(j.get("response"),dict): raise Exception("unknown")
                   fr=j["response"]["flightroute"]; o=fr["origin"]; d=fr["destination"]
                   f=fit(a,(o["latitude"],o["longitude"]),(d["latitude"],d["longitude"]))
                   line+=f"adsbdb {o['iata_code']}-{d['iata_code']} fit {f:>2} | "
