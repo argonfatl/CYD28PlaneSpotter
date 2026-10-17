@@ -23,6 +23,8 @@ jobs:
           ad=lambda a,b: abs(((a-b+540)%360)-180)
           def fit(p,o,d):
               dO=hav(p['lat'],p['lon'],*o); dD=hav(p['lat'],p['lon'],*d); L=hav(*o,*d)
+              alt=p.get('alt_baro',0); vr0=p.get('baro_rate', p.get('geom_rate', 0)) or 0
+              if dO>120 and dD>120 and alt<10000 and (abs(vr0)>500 or alt<5000): return 0
               if dO>40 and dD>40 and dO+dD>L+max(L*.25,150): return 0
               v=p.get('baro_rate', p.get('geom_rate', 0)) or 0
               if dO<=40 or dD<=40:
