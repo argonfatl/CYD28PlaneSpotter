@@ -401,7 +401,7 @@ double toDisplayDist(double km) { return km / KM_PER_UNIT; }
 // Returns the HTTP status code, or a negative value on connection/parse failure.
 // If err is given, a short reason is written there on failure.
 int httpGetJson(const String& url, JsonDocument& doc, JsonDocument* filter,
-                char* err = nullptr, size_t errLen = 0) {
+                char* err = nullptr, size_t errLen = 0, const char* postBody = nullptr) {
   WiFiClientSecure secureClient; secureClient.setInsecure();
   WiFiClient plainClient;
   WiFiClient& client = url.startsWith("https://") ? (WiFiClient&)secureClient : plainClient;
@@ -417,7 +417,9 @@ int httpGetJson(const String& url, JsonDocument& doc, JsonDocument* filter,
     return -1;
   }
 
-  int code = https.GET();
+  int code;
+  if (postBody) { https.addHeader("Content-Type", "application/json"); code = https.POST((uint8_t*)postBody, strlen(postBody)); }
+  else code = https.GET();
   if (code != HTTP_CODE_OK) {
     if (code < 0) {
       // HTTPClient reports every connect failure as "connection refused"; for HTTPS
@@ -617,6 +619,134 @@ bool getRoute(Aircraft& a) {
   routeCache[replaceIdx] = r;
   routeToAircraft(r, a);
   return a.dep[0] != '\0';
+}
+
+// ---------------------------------------------------------------------------
+// Route sanity. Route databases are keyed by callsign and go stale when airlines
+// reuse flight numbers, so every route is checked against where the aircraft is.
+// Returns 1 = fits, 0 = doesn't fit (hide it), -1 = fits but reversed (swap ends).
+// ---------------------------------------------------------------------------
+double angleDiff(double a, double b) { return fabs(fmod(a - b + 540.0, 360.0) - 180.0); }
+
+int routeFit(const Aircraft& a, double oLat, double oLon, double dLat, double dLon) {
+  double dO = haversineKm(a.lat, a.lon, oLat, oLon), dD = haversineKm(a.lat, a.lon, dLat, dLon);
+  double L = haversineKm(oLat, oLon, dLat, dLon);
+  const double NEAR = 40;
+  // Off the corridor between the two airports (an ellipse around the great circle)
+  if (dO > NEAR && dD > NEAR && dO + dD > L + (L * 0.25 > 150 ? L * 0.25 : 150)) return 0;
+  if (dO <= NEAR || dD <= NEAR) {                 // around one of the airports: climb or descent tells
+    bool atOrigin = dO <= dD;
+    if (a.vrateFpm > 600) return atOrigin ? 1 : -1;
+    if (a.vrateFpm < -600) return atOrigin ? -1 : 1;
+    return 1;
+  }
+  // En route: heading away from the destination and toward the origin means reversed
+  if (a.gsKt > 50 && angleDiff(a.trackDeg, bearingDeg(a.lat, a.lon, dLat, dLon)) > 100 &&
+      angleDiff(a.trackDeg, bearingDeg(a.lat, a.lon, oLat, oLon)) < 80) return -1;
+  return 1;
+}
+
+// Second route source: adsb.lol routeset (POST, several callsigns per request)
+struct RsRoute {
+  char cs[10]; bool found;
+  char dep[5], arr[5], depCity[20], arrCity[20];
+  double oLat, oLon, dLat, dLon; uint32_t t;
+};
+RsRoute rsCache[16]; int rsNext = 0;
+
+RsRoute* rsFind(const char* cs) {
+  for (auto& r : rsCache)
+    if (r.cs[0] && strcmp(r.cs, cs) == 0 && millis() - r.t < (r.found ? 7200000UL : 1800000UL)) return &r;
+  return nullptr;
+}
+
+bool usableCallsign(const char* cs) { return strlen(cs) >= 3 && strcmp(cs, "(no id)") != 0 && isalpha((uint8_t)cs[0]); }
+
+void routesetLookup(Aircraft** list, int n) {
+  String body = "{\"planes\":[";
+  char asked[6][10]; int nAsk = 0;
+  for (int i = 0; i < n && nAsk < 6; i++) {
+    const Aircraft& a = *list[i];
+    if (!usableCallsign(a.callsign) || rsFind(a.callsign)) continue;
+    bool dup = false; for (int k = 0; k < nAsk; k++) if (!strcmp(asked[k], a.callsign)) dup = true;
+    if (dup) continue;
+    strcpy(asked[nAsk++], a.callsign);
+    char e[96];
+    snprintf(e, sizeof(e), "%s{\"callsign\":\"%s\",\"lat\":%.4f,\"lng\":%.4f}", nAsk > 1 ? "," : "", a.callsign, a.lat, a.lon);
+    body += e;
+  }
+  if (!nAsk) return;
+  body += "]}";
+
+  JsonDocument filter;
+  filter[0]["callsign"] = true;
+  for (const char* f : {"iata", "icao", "lat", "lon", "location", "name"}) filter[0]["_airports"][0][f] = true;
+  JsonDocument d; char err[48] = "";
+  int code = httpGetJson("https://api.adsb.lol/api/0/routeset", d, &filter, err, sizeof(err), body.c_str());
+  if (code != HTTP_CODE_OK || !d.is<JsonArray>()) { Serial.printf("routeset: %d %s\n", code, err); return; }
+
+  bool got[6] = {};
+  for (JsonObject o : d.as<JsonArray>()) {
+    const char* cs = o["callsign"] | "";
+    int k = -1; for (int j = 0; j < nAsk; j++) if (!strcmp(asked[j], cs)) k = j;
+    JsonArray ap = o["_airports"].as<JsonArray>();
+    if (k < 0 || ap.size() < 2) continue;
+    // Multi-leg routes: take the leg the aircraft is closest to flying
+    const Aircraft* ac = nullptr;
+    for (int i = 0; i < n; i++) if (!strcmp(list[i]->callsign, cs)) { ac = list[i]; break; }
+    int best = 0; double bestX = 1e18;
+    for (size_t i = 0; i + 1 < ap.size(); i++) {
+      double oLa = ap[i]["lat"] | 0.0, oLo = ap[i]["lon"] | 0.0, dLa = ap[i + 1]["lat"] | 0.0, dLo = ap[i + 1]["lon"] | 0.0;
+      double x = ac ? haversineKm(ac->lat, ac->lon, oLa, oLo) + haversineKm(ac->lat, ac->lon, dLa, dLo) - haversineKm(oLa, oLo, dLa, dLo) : 0;
+      if (x < bestX) { bestX = x; best = i; }
+    }
+    JsonObject o1 = ap[best], o2 = ap[best + 1];
+    RsRoute& r = rsCache[rsNext]; rsNext = (rsNext + 1) % 16;
+    r = RsRoute(); strcpy(r.cs, cs); r.found = true; r.t = millis();
+    const char* c1 = o1["iata"] | ""; if (!c1[0]) c1 = o1["icao"] | "";
+    const char* c2 = o2["iata"] | ""; if (!c2[0]) c2 = o2["icao"] | "";
+    copyAscii(r.dep, c1, sizeof(r.dep)); copyAscii(r.arr, c2, sizeof(r.arr));
+    const char* l1 = o1["location"] | ""; if (!l1[0]) l1 = o1["name"] | "";
+    const char* l2 = o2["location"] | ""; if (!l2[0]) l2 = o2["name"] | "";
+    copyAscii(r.depCity, l1, sizeof(r.depCity)); copyAscii(r.arrCity, l2, sizeof(r.arrCity));
+    r.oLat = o1["lat"] | 0.0; r.oLon = o1["lon"] | 0.0; r.dLat = o2["lat"] | 0.0; r.dLon = o2["lon"] | 0.0;
+    got[k] = true;
+    Serial.printf("routeset %s: %s-%s\n", cs, r.dep, r.arr);
+  }
+  for (int k = 0; k < nAsk; k++) if (!got[k]) {        // remember "unknown" too, so we don't ask every poll
+    RsRoute& r = rsCache[rsNext]; rsNext = (rsNext + 1) % 16;
+    r = RsRoute(); strcpy(r.cs, asked[k]); r.found = false; r.t = millis();
+  }
+}
+
+// Picks the route to show: adsb.lol if it fits, else adsbdb if it fits, else none
+void chooseRoute(Aircraft& a) {
+  RsRoute* r = rsFind(a.callsign);
+  if (r && r->found && r->dep[0] && r->arr[0]) {
+    int f = routeFit(a, r->oLat, r->oLon, r->dLat, r->dLon);
+    if (f != 0) {
+      bool sw = f < 0;
+      strcpy(a.dep, sw ? r->arr : r->dep); strcpy(a.arr, sw ? r->dep : r->arr);
+      strcpy(a.depCity, sw ? r->arrCity : r->depCity); strcpy(a.arrCity, sw ? r->depCity : r->arrCity);
+      a.depLat = sw ? r->dLat : r->oLat; a.depLon = sw ? r->dLon : r->oLon;
+      a.arrLat = sw ? r->oLat : r->dLat; a.arrLon = sw ? r->oLon : r->dLon;
+      a.hasCoords = true; a.hasRoute = true;
+      return;
+    }
+  }
+  if (!a.hasRoute || !a.hasCoords) return;
+  int f = routeFit(a, a.depLat, a.depLon, a.arrLat, a.arrLon);
+  if (f == 0) {
+    Serial.printf("Route %s %s-%s doesn't fit the position, hidden\n", a.callsign, a.dep, a.arr);
+    a.hasRoute = false; a.hasCoords = false;
+    a.dep[0] = a.arr[0] = a.depCity[0] = a.arrCity[0] = '\0';
+  } else if (f < 0) {
+    char t[20];
+    strcpy(t, a.dep); strcpy(a.dep, a.arr); strcpy(a.arr, t);
+    strcpy(t, a.depCity); strcpy(a.depCity, a.arrCity); strcpy(a.arrCity, t);
+    double x = a.depLat; a.depLat = a.arrLat; a.arrLat = x;
+    x = a.depLon; a.depLon = a.arrLon; a.arrLon = x;
+  }
 }
 
 // Full aircraft model ("Boeing 737-7V3") and owner from adsbdb, by ICAO hex (small cache)
@@ -1387,8 +1517,15 @@ void dataFetcherTask(void* param) {
         // Routes for the top 5 (cached, so usually no network call)
         for (int i = 0; i < locTop5Count; i++)
           locTop5[i].hasRoute = getRoute(locTop5[i]);
+        if (locSel.valid) locSel.hasRoute = getRoute(locSel);
+        // Check every route against the aircraft's position (and ask adsb.lol too)
+        Aircraft* withRoute[MAX_TOP5 + 1]; int nr = 0;
+        for (int i = 0; i < locTop5Count; i++) withRoute[nr++] = &locTop5[i];
+        if (locSel.valid) withRoute[nr++] = &locSel;
+        routesetLookup(withRoute, nr);
+        for (int i = 0; i < nr; i++) chooseRoute(*withRoute[i]);
         if (locTop5Count > 0) { getAircraftModel(locTop5[0]); locNearest = locTop5[0]; }
-        if (locSel.valid) { locSel.hasRoute = getRoute(locSel); getAircraftModel(locSel); }
+        if (locSel.valid) getAircraftModel(locSel);
 
         // Atomically publish results to the globals used by render()
         xSemaphoreTake(dataMutex, portMAX_DELAY);
