@@ -264,6 +264,7 @@ enum { SHOW_OFF, SHOW_PAGE, SHOW_IDLE };
 struct ScreensConfig {
   bool rotate = false; uint16_t rotateSec = 15;
   uint8_t clockShow = SHOW_IDLE, clockStyle = 0; bool clock24 = false;
+  bool clockAtNight = false;        // clock only while night mode has the screen dimmed
   uint8_t metarShow = SHOW_OFF; char metarIcao[5] = "";
   float idleRange = 10;             // "no aircraft nearby" = none within this (display units)
 } scr;
@@ -3481,16 +3482,24 @@ void initWebServer() {
   <button type="button" class="opt" style="text-align:center" onclick="testNotify()">Send test notification</button>
 </div>
 <div class="card">
-  <h2>Screens</h2>
-  <label class="chk"><input type="checkbox" id="sro")rawliteral" + chk(sc.rotate) + R"rawliteral(> Flip pages automatically every <input type="number" min="5" max="600" id="srs" value=")rawliteral" + String(sc.rotateSec) + R"rawliteral(" style="width:70px;padding:4px;margin:0 4px"> s</label>
-  <div class="hint">Pauses for a minute after you touch the screen.</div>
-  <label>Clock screen</label>
+  <h2>Clock</h2>
+  <label>Show the clock screen</label>
   <select id="scs" style="width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em">)rawliteral" + showOpts(sc.clockShow) + R"rawliteral(</select>
   <div class="row" style="margin-top:4px"><div style="flex:1"><label>Style</label><select id="sst" style="width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em">
     <option value="0")rawliteral" + sel(sc.clockStyle == 0) + R"rawliteral(>Digital</option>
     <option value="1")rawliteral" + sel(sc.clockStyle == 1) + R"rawliteral(>Digital with seconds</option>
     <option value="2")rawliteral" + sel(sc.clockStyle == 2) + R"rawliteral(>Analog</option></select></div>
-  <div style="flex:1"><label>&nbsp;</label><label class="chk"><input type="checkbox" id="s24")rawliteral" + chk(sc.clock24) + R"rawliteral(> 24-hour</label></div></div>
+  <div style="flex:1"><label>Format</label><select id="s24" style="width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em">
+    <option value="0")rawliteral" + sel(!sc.clock24) + R"rawliteral(>12-hour (3:45 PM)</option>
+    <option value="1")rawliteral" + sel(sc.clock24) + R"rawliteral(>24-hour (15:45)</option></select></div></div>
+  <label class="chk"><input type="checkbox" id="scn")rawliteral" + chk(sc.clockAtNight) + R"rawliteral(> At night, while the screen is dimmed, show only the clock</label>
+  <div class="hint">Uses the Night mode schedule below. A tap wakes the screen with the normal pages for 30 seconds.</div>
+  <button type="button" onclick="saveClock()">Save clock</button>
+</div>
+<div class="card">
+  <h2>Screens</h2>
+  <label class="chk"><input type="checkbox" id="sro")rawliteral" + chk(sc.rotate) + R"rawliteral(> Flip pages automatically every <input type="number" min="5" max="600" id="srs" value=")rawliteral" + String(sc.rotateSec) + R"rawliteral(" style="width:70px;padding:4px;margin:0 4px"> s</label>
+  <div class="hint">Pauses for a minute after you touch the screen.</div>
   <label>METAR screen (airport weather report)</label>
   <select id="sms" style="width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em">)rawliteral" + showOpts(sc.metarShow) + R"rawliteral(</select>
   <label>Airport (ICAO code, empty = nearest)</label>
@@ -3645,9 +3654,13 @@ function testNotify(){
     post('/notify-test','',function(){setTimeout(function(){fetch('/notify-status').then(function(r){return r.text()}).then(function(t){$('nst').textContent=t})},4000)});
   });
 }
+function saveClock(){
+  post('/clock','cs='+$('scs').value+'&st='+$('sst').value+'&c24='+$('s24').value+'&cn='+($('scn').checked?1:0),
+    function(x){flash(x.status==200?'✓ Clock saved!':x.responseText)});
+}
 function saveScreens(){
   var b=function(i){return $(i).checked?1:0};
-  post('/screens','ro='+b('sro')+'&rs='+$('srs').value+'&cs='+$('scs').value+'&st='+$('sst').value+'&c24='+b('s24')+
+  post('/screens','ro='+b('sro')+'&rs='+$('srs').value+
     '&ms='+$('sms').value+'&mi='+encodeURIComponent($('smi').value.trim().toUpperCase())+'&ir='+$('sir').value+'&eb='+b('seb'),
     function(x){flash(x.status==200?'✓ Screens saved!':x.responseText)});
 }
@@ -3902,15 +3915,16 @@ function forget(){
   server.on("/screens", HTTP_POST, []() {
     ScreensConfig c;
     c.rotate = server.arg("ro") == "1";
-    int rs = server.arg("rs").toInt(), cs = server.arg("cs").toInt(), st = server.arg("st").toInt(), ms = server.arg("ms").toInt();
+    int rs = server.arg("rs").toInt(), ms = server.arg("ms").toInt();
     float ir = server.arg("ir").toFloat();
     String mi = server.arg("mi"); mi.trim(); mi.toUpperCase();
     bool icaoOk = mi.length() == 0 || mi.length() == 4;
     for (unsigned i = 0; i < mi.length(); i++) if (!isalnum((uint8_t)mi[i])) icaoOk = false;
-    if (rs < 5 || rs > 600 || cs < 0 || cs > 2 || st < 0 || st > 2 || ms < 0 || ms > 2 || ir < 1 || ir > 100 || !icaoOk) {
+    if (rs < 5 || rs > 600 || ms < 0 || ms > 2 || ir < 1 || ir > 100 || !icaoOk) {
       server.send(400, "text/plain", "Invalid values (airport: 4-letter ICAO code or empty)"); return;
     }
-    c.rotateSec = rs; c.clockShow = cs; c.clockStyle = st; c.clock24 = server.arg("c24") == "1";
+    c.rotateSec = rs;
+    c.clockShow = scr.clockShow; c.clockStyle = scr.clockStyle; c.clock24 = scr.clock24; c.clockAtNight = scr.clockAtNight;
     c.metarShow = ms; copyAscii(c.metarIcao, mi.c_str(), sizeof(c.metarIcao)); c.idleRange = ir;
     bool metarChanged = strcmp(c.metarIcao, scr.metarIcao) != 0 || (c.metarShow != SHOW_OFF && scr.metarShow == SHOW_OFF);
     if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
@@ -3918,10 +3932,23 @@ function forget(){
     if (configMutex) xSemaphoreGive(configMutex);
     emergencyBanner = server.arg("eb") == "1";
     prefs.putBool("rot_on", c.rotate); prefs.putUShort("rot_sec", c.rotateSec);
-    prefs.putUChar("clk_show", c.clockShow); prefs.putUChar("clk_style", c.clockStyle); prefs.putBool("clk_24", c.clock24);
     prefs.putUChar("mtr_show", c.metarShow); prefs.putString("mtr_icao", c.metarIcao); prefs.putFloat("idle_rng", c.idleRange);
     prefs.putBool("emg_on", emergencyBanner);
     if (metarChanged) { if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY); metar = Metar(); if (dataMutex) xSemaphoreGive(dataMutex); metarErr[0] = '\0'; metarRequested = true; }
+    lastScreen = 255;
+    server.send(200, "text/plain", "OK");
+  });
+
+  // POST /clock — clock screen: when to show it, style, 12/24 h, clock-only at night
+  server.on("/clock", HTTP_POST, []() {
+    int cs = server.arg("cs").toInt(), st = server.arg("st").toInt();
+    if (cs < 0 || cs > 2 || st < 0 || st > 2) { server.send(400, "text/plain", "Invalid values"); return; }
+    if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+    scr.clockShow = cs; scr.clockStyle = st; scr.clock24 = server.arg("c24") == "1";
+    scr.clockAtNight = server.arg("cn") == "1";
+    if (configMutex) xSemaphoreGive(configMutex);
+    prefs.putUChar("clk_show", scr.clockShow); prefs.putUChar("clk_style", scr.clockStyle);
+    prefs.putBool("clk_24", scr.clock24); prefs.putBool("clk_night", scr.clockAtNight);
     lastScreen = 255;
     server.send(200, "text/plain", "OK");
   });
@@ -4143,6 +4170,7 @@ void setup() {
   PREF("clk_show", getUChar, scr.clockShow);
   PREF("clk_style", getUChar, scr.clockStyle);
   PREF("clk_24", getBool, scr.clock24);
+  PREF("clk_night", getBool, scr.clockAtNight);
   PREF("mtr_show", getUChar, scr.metarShow);
   if (prefs.isKey("mtr_icao")) copyAscii(scr.metarIcao, prefs.getString("mtr_icao").c_str(), sizeof(scr.metarIcao));
   PREF("idle_rng", getFloat, scr.idleRange);
@@ -4203,6 +4231,20 @@ void autoScreens() {
   static bool idle = false; static uint8_t beforeIdle = S_NEAREST;
   static uint32_t quietSince = 0, lastSwitch = 0;
   uint32_t now = millis();
+
+  // Night: while the screen is dimmed, only the clock; a tap (wake) brings back the page
+  static bool nightClock = false; static uint8_t beforeNight = S_NEAREST;
+  if (scr.clockAtNight && nightDimmed()) {
+    if (!nightClock) { nightClock = true; beforeNight = screen == S_CLOCK ? S_NEAREST : screen; }
+    if (screen != S_CLOCK) screen = S_CLOCK;
+    return;
+  }
+  if (nightClock) {
+    nightClock = false; lastSwitch = now;
+    if (screen == S_CLOCK) screen = beforeNight;
+    return;
+  }
+
   if (screen == SCREEN_SETTINGS) return;
   bool userActive = lastTouchMs && now - lastTouchMs < 60000UL;
   bool idleClock = scr.clockShow == SHOW_IDLE, idleMetar = scr.metarShow == SHOW_IDLE;
