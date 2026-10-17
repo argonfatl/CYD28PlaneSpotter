@@ -237,7 +237,7 @@ Aircraft top5[MAX_TOP5];
 uint8_t top5Count = 0;
 
 // Blips for Radar (the MAX_BLIPS nearest aircraft)
-struct Blip { double lat; double lon; float track; float speedKt; char callsign[10]; int altFt; double distKm; char hex[8]; };
+struct Blip { double lat; double lon; float track; float speedKt; char callsign[10]; int altFt; double distKm; char hex[8]; bool heli; };
 
 // Emergency squawk (7500 / 7600 / 7700 or a readsb emergency state) anywhere in the search area
 struct Emergency {
@@ -1142,6 +1142,7 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
       b.altFt = altFt; b.distKm = d;
       strcpy(b.callsign, cs);
       copyAscii(b.hex, s["hex"] | "", sizeof(b.hex));
+      b.heli = strcmp(category, "A7") == 0;
     }
 
     Aircraft a;
@@ -1748,6 +1749,31 @@ void drawPlaneGlyph(TFT_eSPI& g, int cx, int cy, float sc, float angleDeg, uint1
 }
 void drawPlaneGlyph(int cx, int cy, float sc, float angleDeg, uint16_t color) { drawPlaneGlyph(tft, cx, cy, sc, angleDeg, color); }
 
+// Helicopter seen from above: body, tapered tail boom, tail rotor and a crossed main rotor.
+// Same size and angle convention as drawPlaneGlyph.
+void drawHeliGlyph(TFT_eSPI& g, int cx, int cy, float sc, float angleDeg, uint16_t color) {
+  float a = angleDeg * PI / 180.0f, ca = cosf(a), sa = sinf(a);
+  auto X = [&](float x, float y) { return cx + (int)lroundf(sc * (x * ca - y * sa)); };
+  auto Y = [&](float x, float y) { return cy + (int)lroundf(sc * (x * sa + y * ca)); };
+  // Tail boom (tapered) and tail rotor
+  g.fillTriangle(X(0.05f, -0.12f), Y(0.05f, -0.12f), X(0.05f, 0.12f), Y(0.05f, 0.12f), X(-1.0f, 0), Y(-1.0f, 0), color);
+  g.drawLine(X(-0.95f, -0.3f), Y(-0.95f, -0.3f), X(-0.95f, 0.3f), Y(-0.95f, 0.3f), color);
+  // Body
+  int r = (int)lroundf(sc * 0.34f); if (r < 2) r = 2;
+  g.fillCircle(X(0.25f, 0), Y(0.25f, 0), r, color);
+  // Main rotor: two blades crossing over the body
+  for (float d : {0.785f, -0.785f}) {
+    float bx = cosf(d) * 1.15f, by = sinf(d) * 1.15f;
+    g.drawLine(X(0.25f + bx, by), Y(0.25f + bx, by), X(0.25f - bx, -by), Y(0.25f - bx, -by), color);
+    if (sc >= 9) g.drawLine(X(0.25f + bx, by) + 1, Y(0.25f + bx, by), X(0.25f - bx, -by) + 1, Y(0.25f - bx, -by), color);
+  }
+}
+
+// Aircraft symbol: a helicopter for rotorcraft (ADS-B category A7), otherwise an airplane
+void drawCraftGlyph(TFT_eSPI& g, bool heli, int cx, int cy, float sc, float angleDeg, uint16_t color) {
+  if (heli) drawHeliGlyph(g, cx, cy, sc, angleDeg, color); else drawPlaneGlyph(g, cx, cy, sc, angleDeg, color);
+}
+
 void arrowUpDown(int cx, int cy, int s, bool up, uint16_t c) {
   if (up) { tft.fillTriangle(cx - s, cy + s / 2, cx + s, cy + s / 2, cx, cy - s, c); tft.fillRect(cx - s / 3, cy + s / 2, 2 * s / 3 + 1, s, c); }
   else    { tft.fillTriangle(cx - s, cy - s / 2, cx + s, cy - s / 2, cx, cy + s, c); tft.fillRect(cx - s / 3, cy - 3 * s / 2, 2 * s / 3 + 1, s, c); }
@@ -1955,7 +1981,7 @@ void screenTargetIntel(bool newPage) {
   tft.setFreeFont(&FreeSans9pt7b); tft.setTextColor(C_SOFT, C_PANEL);
   tft.drawString(fitPx(a.airline[0] ? a.airline : (a.model[0] ? a.model : "Unknown operator"), 200), 12, 62);
   bool mil = a.dbFlags & 1, heli = strcmp(a.category, "A7") == 0;
-  drawPlaneGlyph(240, 51, 15, -90, mil ? C_WARN : C_CYAN);
+  drawCraftGlyph(tft, heli, 240, 51, 15, -90, mil ? C_WARN : C_CYAN);
   tft.setTextFont(2); tft.setTextColor(C_SOFT, C_PANEL); tft.setTextDatum(TR_DATUM);
   tft.drawString(mil ? "MIL" : heli ? "HELI" : (a.type[0] ? a.type : ""), 306, 58);
   tft.setTextDatum(TL_DATUM);
@@ -1985,7 +2011,7 @@ void screenTargetIntel(bool newPage) {
     tft.drawFastHLine(x0, ly, px - x0, C_CYAN);
     tft.fillCircle(x0, ly, 2, C_CYAN); tft.fillCircle(x1, ly, 2, C_EDGE);
     tft.fillRect(px - 9, ly - 8, 19, 17, C_PANEL);
-    drawPlaneGlyph(px, ly, 8, 0, C_CYAN);
+    drawCraftGlyph(tft, strcmp(a.category, "A7") == 0, px, ly, 8, 0, C_CYAN);
   } else {
     tft.setFreeFont(&FreeSans9pt7b); tft.setTextColor(C_SOFT, C_PANEL); tft.setTextDatum(MC_DATUM);
     tft.drawString("Route unknown", 160, 105);
@@ -2027,7 +2053,7 @@ void screenTargetIntel(bool newPage) {
     tft.drawString(k == 0 ? (v >= 0 ? "N" : "S") : (v >= 0 ? "E" : "W"), 116 + w + 8, y);
   }
   bool up = a.vrateFpm >= 300, down = a.vrateFpm <= -300;
-  drawPlaneGlyph(274, R2 + 32, 11, up ? -35 : down ? 35 : 0, up ? C_GREEN : down ? C_WARN : C_SOFT);
+  drawCraftGlyph(tft, strcmp(a.category, "A7") == 0, 274, R2 + 32, 11, up ? -35 : down ? 35 : 0, up ? C_GREEN : down ? C_WARN : C_SOFT);
   if (up || down) {
     arrowUpDown(304, R2 + 26, 4, up, up ? C_GREEN : C_WARN);
     tft.setTextFont(1); tft.setTextColor(C_SOFT, C_PANEL);
@@ -2068,11 +2094,11 @@ void screenTop5(bool newPage) {
   for (int i = 0; i < top5Count && i < MAX_TOP5; i++) {
     const Aircraft& a = top5[i];
     int y = TR_Y + i * TR_STEP;
-    bool isTarget = ap && strcmp(ap->callsign, a.callsign) == 0;
+    bool isTarget = ap && strcmp(ap->hex, a.hex) == 0;
     card(4, y, 312, TR_H);
     if (isTarget) { tft.drawRoundRect(4, y, 312, TR_H, 6, C_CYAN); tft.drawRoundRect(5, y + 1, 310, TR_H - 2, 5, C_CYAN); }
     bool mil = a.dbFlags & 1;
-    drawPlaneGlyph(22, y + 19, 9, -90, mil ? C_WARN : isTarget ? C_CYAN : C_GREEN);
+    drawCraftGlyph(tft, strcmp(a.category, "A7") == 0, 22, y + 19, 9, -90, mil ? C_WARN : isTarget ? C_CYAN : C_GREEN);
 
     tft.setFreeFont(&FreeSansBold9pt7b); tft.setTextColor(C_TEXT, C_PANEL);
     tft.drawString(fitPx(a.callsign, 130), 40, y + 3);
@@ -2228,12 +2254,12 @@ void screenRadar(bool newPage) {
     bool isTarget = ap && strcmp(ap->hex, blips[i].hex) == 0;
     if (isTarget) {
       radarSpr.drawCircle(bx, by, 11, C_CYAN);
-      drawPlaneGlyph(radarSpr, bx, by, 8, blips[i].track - 90, C_CYAN);
+      drawCraftGlyph(radarSpr, blips[i].heli, bx, by, 8, blips[i].track - 90, C_CYAN);
       radarSpr.setTextColor(C_CYAN, C_SCOPE);
       int lx = bx + 13; if (lx + 50 > SCOPE) lx = bx - 63;
       radarSpr.drawString(blips[i].callsign, lx, by - 4);
     } else {
-      drawPlaneGlyph(radarSpr, bx, by, 6, blips[i].track - 90, C_GREEN);
+      drawCraftGlyph(radarSpr, blips[i].heli, bx, by, 6, blips[i].track - 90, C_GREEN);
     }
   }
   radarSpr.pushSprite(SCOPE_X, SCOPE_Y);
@@ -3269,6 +3295,7 @@ void selectAircraft(const char* hex, const Blip* b) {
     copyAscii(a.callsign, b->callsign[0] ? b->callsign : "(no id)", sizeof(a.callsign));
     a.lat = b->lat; a.lon = b->lon; a.altFt = b->altFt; a.gsKt = b->speedKt; a.trackDeg = b->track;
     a.distanceKm = b->distKm; a.bearingDeg = bearingDeg(homeLat, homeLon, b->lat, b->lon);
+    if (b->heli) strcpy(a.category, "A7");
     selAc = a;
   }
   if (dataMutex) xSemaphoreGive(dataMutex);
