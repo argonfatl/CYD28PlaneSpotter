@@ -632,6 +632,10 @@ int routeFit(const Aircraft& a, double oLat, double oLon, double dLat, double dL
   double dO = haversineKm(a.lat, a.lon, oLat, oLon), dD = haversineKm(a.lat, a.lon, dLat, dLon);
   double L = haversineKm(oLat, oLon, dLat, dLon);
   const double NEAR = 40;
+  // Below 10,000 ft an airliner is climbing out of or descending into an airport, not
+  // cruising between two distant ones: it must be near one of them (short hops excepted)
+  if (dO > 120 && dD > 120 && a.altFt < 10000 &&
+      (a.vrateFpm > 500 || a.vrateFpm < -500 || a.altFt < 5000 || L > 400)) return 0;
   // Off the corridor between the two airports (an ellipse around the great circle)
   if (dO > NEAR && dD > NEAR && dO + dD > L + (L * 0.25 > 150 ? L * 0.25 : 150)) return 0;
   if (dO <= NEAR || dD <= NEAR) {                 // around one of the airports: climb or descent tells
@@ -653,6 +657,7 @@ struct RsRoute {
   double oLat, oLon, dLat, dLon; uint32_t t;
 };
 RsRoute rsCache[16]; int rsNext = 0;
+char routesetStatus[48] = "not used yet";   // shown on the web page
 
 RsRoute* rsFind(const char* cs) {
   for (auto& r : rsCache)
@@ -683,7 +688,11 @@ void routesetLookup(Aircraft** list, int n) {
   for (const char* f : {"iata", "icao", "lat", "lon", "location", "name"}) filter[0]["_airports"][0][f] = true;
   JsonDocument d; char err[48] = "";
   int code = httpGetJson("https://api.adsb.lol/api/0/routeset", d, &filter, err, sizeof(err), body.c_str());
-  if (code != HTTP_CODE_OK || !d.is<JsonArray>()) { Serial.printf("routeset: %d %s\n", code, err); return; }
+  if (code != HTTP_CODE_OK || !d.is<JsonArray>()) {
+    Serial.printf("routeset: %d %s\n", code, err);
+    snprintf(routesetStatus, sizeof(routesetStatus), "error %d %s", code, err);
+    return;
+  }
 
   bool got[6] = {};
   for (JsonObject o : d.as<JsonArray>()) {
@@ -713,6 +722,8 @@ void routesetLookup(Aircraft** list, int n) {
     got[k] = true;
     Serial.printf("routeset %s: %s-%s\n", cs, r.dep, r.arr);
   }
+  { int ng = 0; for (int k = 0; k < nAsk; k++) ng += got[k];
+    snprintf(routesetStatus, sizeof(routesetStatus), "OK, last answer %d of %d", ng, nAsk); }
   for (int k = 0; k < nAsk; k++) if (!got[k]) {        // remember "unknown" too, so we don't ask every poll
     RsRoute& r = rsCache[rsNext]; rsNext = (rsNext + 1) % 16;
     r = RsRoute(); strcpy(r.cs, asked[k]); r.found = false; r.t = millis();
@@ -3718,6 +3729,7 @@ void initWebServer() {
   <div style="font-size:0.9em;color:#aaa">Connected to <b>)rawliteral" + ssid + R"rawliteral(</b>. Forgetting it restarts the device into setup mode: join the <b>)rawliteral" + String(SETUP_AP_NAME) + R"rawliteral(</b> network from your phone to pick a new one.</div>
   <button type="button" class="danger" onclick="forget()">Forget WiFi &amp; restart</button>
 </div>
+<div class="info">Route source adsb.lol: )rawliteral" + String(routesetStatus) + R"rawliteral(</div>
 <div class="info">http://)rawliteral" + String(DEVICE_HOSTNAME) + R"rawliteral(.local &middot; IP )rawliteral" + WiFi.localIP().toString() + R"rawliteral(</div>
 <script>
 function $(i){return document.getElementById(i)}
