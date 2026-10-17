@@ -1,0 +1,70 @@
+name: Diagnose routes
+on:
+  pull_request:
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Live routes near Lombard
+        shell: python
+        run: |
+          import json, math, urllib.request
+          UA = {"User-Agent": "CYD28PlaneSpotter-diag (+https://github.com/argonfatl/CYD28PlaneSpotter)"}
+          def get(url, body=None):
+              req = urllib.request.Request(url, data=body, headers=dict(UA, **({"Content-Type": "application/json"} if body else {})))
+              with urllib.request.urlopen(req, timeout=30) as r: return json.loads(r.read())
+          def hav(a,b,c,d):
+              p1,p2=math.radians(a),math.radians(c); dp=p2-p1; dl=math.radians(d-b)
+              x=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2; return 2*6371*math.asin(math.sqrt(x))
+          def brg(a,b,c,d):
+              p1,p2=math.radians(a),math.radians(c); dl=math.radians(d-b)
+              y=math.sin(dl)*math.cos(p2); x=math.cos(p1)*math.sin(p2)-math.sin(p1)*math.cos(p2)*math.cos(dl)
+              return (math.degrees(math.atan2(y,x))+360)%360
+          ad=lambda a,b: abs(((a-b+540)%360)-180)
+          def fit(p,o,d):
+              dO=hav(p['lat'],p['lon'],*o); dD=hav(p['lat'],p['lon'],*d); L=hav(*o,*d)
+              if dO>40 and dD>40 and dO+dD>L+max(L*.25,150): return 0
+              v=p.get('baro_rate', p.get('geom_rate', 0)) or 0
+              if dO<=40 or dD<=40:
+                  atO=dO<=dD
+                  if v>600: return 1 if atO else -1
+                  if v<-600: return -1 if atO else 1
+                  return 1
+              t=p.get('track',0) or 0
+              if (p.get('gs',0) or 0)>50 and ad(t,brg(p['lat'],p['lon'],*d))>100 and ad(t,brg(p['lat'],p['lon'],*o))<80: return -1
+              return 1
+          out=[]
+          ac=[a for a in get("https://api.airplanes.live/v2/point/41.88/-88.0078/25")["ac"] if a.get("flight","").strip() and isinstance(a.get("alt_baro"),int) and "lat" in a]
+          ac.sort(key=lambda a: hav(41.88,-88.0078,a["lat"],a["lon"]))
+          ac=ac[:15]
+          body=json.dumps({"planes":[{"callsign":a["flight"].strip(),"lat":a["lat"],"lng":a["lon"]} for a in ac]}).encode()
+          try:
+              rs=get("https://api.adsb.lol/api/0/routeset", body)
+          except Exception as e:
+              rs=[]; out.append(f"routeset ERROR {e}")
+          raw=json.dumps(rs)[:1200]
+          rsmap={r.get("callsign"):r for r in rs} if isinstance(rs,list) else {}
+          for a in ac:
+              cs=a["flight"].strip(); line=f"{cs:8} alt {a['alt_baro']:>6} vr {a.get('baro_rate',a.get('geom_rate',0)) or 0:>6} trk {int(a.get('track',0) or 0):>3} | "
+              try:
+                  j=get(f"https://api.adsbdb.com/v0/callsign/{cs}")
+                  fr=j["response"]["flightroute"]; o=fr["origin"]; d=fr["destination"]
+                  f=fit(a,(o["latitude"],o["longitude"]),(d["latitude"],d["longitude"]))
+                  line+=f"adsbdb {o['iata_code']}-{d['iata_code']} fit {f:>2} | "
+              except Exception as e:
+                  line+=f"adsbdb none | "
+              r=rsmap.get(cs)
+              if r:
+                  aps=r.get("_airports") or []
+                  codes=r.get("_airport_codes_iata") or r.get("airport_codes")
+                  if len(aps)>=2:
+                      f=fit(a,(aps[0]["lat"],aps[0]["lon"]),(aps[-1]["lat"],aps[-1]["lon"]))
+                      line+=f"routeset {codes} plausible {r.get('plausible')} fit {f:>2}"
+                  else: line+=f"routeset {codes} plausible {r.get('plausible')} (no airports)"
+              else: line+="routeset none"
+              out.append(line)
+          def note(title,lines):
+              msg="%0A".join(l.replace("%","%25") for l in lines)
+              print(f"::notice title={title}::{msg}")
+          note("routes", out)
+          note("routeset raw", [raw[i:i+200] for i in range(0,len(raw),200)])
