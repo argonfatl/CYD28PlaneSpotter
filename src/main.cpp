@@ -247,6 +247,7 @@ struct Emergency {
 };
 Emergency emergency;                // published under dataMutex
 bool emergencyBanner = true;        // red banner on the screen (NVS "emg_on")
+bool screenMirror = false;          // web page shows the screen and passes taps (NVS "mirror")
 
 // Selected aircraft (tap a traffic row or a radar blip): followed by ICAO address
 char selectedHex[8] = "";
@@ -3149,6 +3150,8 @@ void updateNavOverlay() {
 }
 
 // Acts once per press (on touch-down), using the calibrated mapping
+void handleTap(int sx, int sy);
+
 void checkTouch() {
   static bool wasDown = false;
   int rx, ry;
@@ -3169,6 +3172,11 @@ void checkTouch() {
   int sx, sy;
   mapTouch(rx, ry, sx, sy);
   Serial.printf("Touch: raw(%d,%d) -> screen(%d,%d)\n", rx, ry, sx, sy);
+  handleTap(sx, sy);
+}
+
+// A tap at screen coordinates: from the touch panel, or from the web page's screen mirror
+void handleTap(int sx, int sy) {
 
   // Top-right corner (clock / WiFi icon): settings
   if (sy < 30 && sx >= 250) {
@@ -3482,6 +3490,20 @@ void initWebServer() {
   <button type="button" class="opt" style="text-align:center" onclick="testNotify()">Send test notification</button>
 </div>
 <div class="card">
+  <h2>Screen mirror</h2>
+  <label class="chk"><input type="checkbox" id="mon")rawliteral" + chk(screenMirror) + R"rawliteral( onchange="post('/mirror','on='+(this.checked?1:0),function(){location.reload()})"> Show the device screen here (tap the picture to tap the screen)</label>
+  <div id="mbox" style="display:)rawliteral" + String(screenMirror ? "block" : "none") + R"rawliteral(">
+    <img id="mimg" alt="Device screen" style="width:100%;aspect-ratio:4/3;border-radius:8px;border:1px solid #1f3b57;background:#000;cursor:pointer;image-rendering:pixelated" onclick="mtap(event)">
+    <div class="row" style="margin-top:8px;align-items:center">
+      <select id="mint" style="flex:1;padding:8px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff" onchange="msched()">
+        <option value="0">Refresh by hand</option><option value="3">Every 3 s</option><option value="5" selected>Every 5 s</option><option value="10">Every 10 s</option></select>
+      <button type="button" onclick="mload()">Refresh</button>
+    </div>
+    <label class="chk"><input type="checkbox" id="mrb" onchange="mload()"> Colors look swapped (red / blue)</label>
+    <div class="hint">Each picture freezes the device screen for about a second while it is read.</div>
+  </div>
+</div>
+<div class="card">
   <h2>Clock</h2>
   <label>Show the clock screen</label>
   <select id="scs" style="width:100%;padding:10px;border:1px solid #1f3b57;border-radius:6px;background:#08111b;color:#fff;font-size:1em">)rawliteral" + showOpts(sc.clockShow) + R"rawliteral(</select>
@@ -3653,6 +3675,29 @@ function testNotify(){
     $('nst').textContent='Sending...';
     post('/notify-test','',function(){setTimeout(function(){fetch('/notify-status').then(function(r){return r.text()}).then(function(t){$('nst').textContent=t})},4000)});
   });
+}
+var mTimer=null,mBusy=false;
+function mload(){
+  if(!$('mon').checked||mBusy)return;
+  mBusy=true;var i=new Image();
+  i.onload=function(){$('mimg').src=i.src;mBusy=false};i.onerror=function(){mBusy=false};
+  i.src='/screen.bmp?rb='+($('mrb').checked?1:0)+'&t='+Date.now();
+}
+function msched(){
+  if(mTimer)clearInterval(mTimer);mTimer=null;
+  var s=+$('mint').value;
+  try{localStorage.setItem('mint',s);localStorage.setItem('mrb',$('mrb').checked?1:0)}catch(e){}
+  if(s>0)mTimer=setInterval(function(){if(!document.hidden)mload()},s*1000);
+}
+function mtap(e){
+  var r=e.target.getBoundingClientRect();
+  var x=Math.round((e.clientX-r.left)*320/r.width),y=Math.round((e.clientY-r.top)*240/r.height);
+  post('/tap','x='+x+'&y='+y,function(){setTimeout(mload,500)});
+}
+if($('mon').checked){
+  try{var v=localStorage.getItem('mint');if(v!==null)$('mint').value=v;$('mrb').checked=localStorage.getItem('mrb')=='1'}catch(e){}
+  $('mrb').addEventListener('change',msched);
+  mload();msched();
 }
 function saveClock(){
   post('/clock','cs='+$('scs').value+'&st='+$('sst').value+'&c24='+$('s24').value+'&cn='+($('scn').checked?1:0),
@@ -3939,6 +3984,48 @@ function forget(){
     server.send(200, "text/plain", "OK");
   });
 
+  // Screen mirror: on/off, the current screen as a BMP, and taps from the page
+  server.on("/mirror", HTTP_POST, []() {
+    screenMirror = server.arg("on") == "1";
+    prefs.putBool("mirror", screenMirror);
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/screen.bmp", HTTP_GET, []() {
+    if (!screenMirror) { server.send(403, "text/plain", "Screen mirror is off"); return; }
+    const int W = 320, H = 240, ROWS = 4;
+    uint16_t* buf = (uint16_t*)malloc(W * ROWS * 2);
+    if (!buf) { server.send(503, "text/plain", "Out of memory"); return; }
+    bool rb = server.arg("rb") == "1";
+    // 16-bit BMP (RGB565 bit fields), stored top-down
+    uint8_t h[66] = {0};
+    auto put32 = [&](int o, uint32_t v) { for (int i = 0; i < 4; i++) h[o + i] = (v >> (8 * i)) & 0xFF; };
+    h[0] = 'B'; h[1] = 'M';
+    put32(2, 66 + W * H * 2); put32(10, 66);
+    put32(14, 40); put32(18, W); put32(22, (uint32_t)(-H));
+    h[26] = 1; h[28] = 16; put32(30, 3); put32(34, W * H * 2); put32(38, 2835); put32(42, 2835);
+    put32(54, rb ? 0x001F : 0xF800); put32(58, 0x07E0); put32(62, rb ? 0xF800 : 0x001F);
+    server.setContentLength(66 + W * H * 2);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "image/bmp", "");
+    server.sendContent((const char*)h, sizeof(h));
+    for (int y = 0; y < H; y += ROWS) {
+      tft.readRect(0, y, W, ROWS, buf);
+      for (int i = 0; i < W * ROWS; i++) buf[i] = (buf[i] >> 8) | (buf[i] << 8);   // to little-endian RGB565
+      server.sendContent((const char*)buf, W * ROWS * 2);
+    }
+    free(buf);
+  });
+  server.on("/tap", HTTP_POST, []() {
+    if (!screenMirror) { server.send(403, "text/plain", "Screen mirror is off"); return; }
+    int x = server.arg("x").toInt(), y = server.arg("y").toInt();
+    if (x < 0 || x > 319 || y < 0 || y > 239) { server.send(400, "text/plain", "Bad position"); return; }
+    lastTouchMs = millis();
+    if (nightNow()) nightWakeUntil = millis() + NIGHT_WAKE_MS;
+    Serial.printf("Web tap: (%d,%d)\n", x, y);
+    handleTap(x, y);
+    server.send(200, "text/plain", "OK");
+  });
+
   // POST /clock — clock screen: when to show it, style, 12/24 h, clock-only at night
   server.on("/clock", HTTP_POST, []() {
     int cs = server.arg("cs").toInt(), st = server.arg("st").toInt();
@@ -4175,6 +4262,7 @@ void setup() {
   if (prefs.isKey("mtr_icao")) copyAscii(scr.metarIcao, prefs.getString("mtr_icao").c_str(), sizeof(scr.metarIcao));
   PREF("idle_rng", getFloat, scr.idleRange);
   PREF("emg_on", getBool, emergencyBanner);
+  PREF("mirror", getBool, screenMirror);
   PREF("col_start", getUInt, colStart);
   // Notification kinds added in 1.5 are on by default for existing setups too
   if (!prefs.isKey("ntf_v2")) { notifyCfg.cats |= NT_EMERG | NT_NEWTYPE; prefs.putBool("ntf_v2", true); prefs.putUChar("ntf_cats", notifyCfg.cats); }
