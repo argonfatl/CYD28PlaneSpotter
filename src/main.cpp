@@ -657,7 +657,7 @@ struct RsRoute {
   double oLat, oLon, dLat, dLon; uint32_t t;
 };
 RsRoute rsCache[16]; int rsNext = 0;
-char routesetStatus[48] = "not used yet";   // shown on the web page
+char routesetStatus[72] = "not used yet";   // shown on the web page
 
 RsRoute* rsFind(const char* cs) {
   for (auto& r : rsCache)
