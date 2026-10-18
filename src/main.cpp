@@ -247,6 +247,7 @@ struct Emergency {
 };
 Emergency emergency;                // published under dataMutex
 bool emergencyBanner = true;        // red banner on the screen (NVS "emg_on")
+bool heliOnly = false;              // radar, traffic and nearest show helicopters only (NVS "heli_only")
 bool screenMirror = false;          // web page shows the screen and passes taps (NVS "mirror")
 
 // Selected aircraft (tap a traffic row or a radar blip): followed by ICAO address
@@ -1109,7 +1110,8 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
                           "track", "baro_rate", "geom_rate", "category", "dbFlags", "squawk", "emergency"})
     filter[fld] = true;
 
-  uint16_t count = 0;
+  uint16_t count = 0, shown = 0;
+  bool onlyHeli = heliOnly;
   NotifyConfig nc;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
   nc = notifyCfg;
@@ -1180,6 +1182,11 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
       }
     }
 
+    // Helicopters only: everything above (alerts, log, collection, emergencies) still sees
+    // all aircraft; the radar, traffic list and nearest card show helicopters only
+    if (onlyHeli && strcmp(category, "A7") != 0) return;
+    shown++;
+
     // Radar: up to MAX_BLIPS aircraft inside the radar range, spread over 4 distance rings
     // (10 per ring, nearest first) so a wide range doesn't show only the centre
     if (d <= radarKm) {
@@ -1238,7 +1245,7 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     int i = (start + k) % NUM_SOURCES;
     String url = sourceUrl(i, hLat, hLon, (int)ceilf(queryNm));
     char err[72] = "";
-    count = 0; blipCntOut = 0; top5CntOut = 0; notifyCandN = 0;     // a failed source may have sent some
+    count = 0; shown = 0; blipCntOut = 0; top5CntOut = 0; notifyCandN = 0;     // a failed source may have sent some
     alertOut = AlertInfo(); emOut = Emergency(); selOut.valid = false;
     if (streamAircraft(url, filter, onAircraft, err, sizeof(err)) == HTTP_CODE_OK) {
       ok = true;
@@ -1251,7 +1258,7 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   }
   if (!ok) { stats.requestsFail++; return false; }
 
-  stats.inView = count; if (count > stats.maxInView) stats.maxInView = count;
+  stats.inView = onlyHeli ? shown : count; if (stats.inView > stats.maxInView) stats.maxInView = stats.inView;
   stats.requestsOk++;
 
   if (top5CntOut > 0) {
@@ -2028,7 +2035,7 @@ void screenTargetIntel(bool newPage) {
   const Aircraft* ap = targetAircraft(&sel);
   static bool lastSel = false;
   if (sel != lastSel) { lastSel = sel; newPage = true; tft.fillScreen(C_BG); }
-  drawHeader(sel ? "SELECTED AIRCRAFT" : "NEAREST AIRCRAFT", newPage);
+  drawHeader(sel ? (heliOnly ? "SELECTED HELICOPTER" : "SELECTED AIRCRAFT") : (heliOnly ? "NEAREST HELICOPTER" : "NEAREST AIRCRAFT"), newPage);
 
   // Redraw only when the data or the selection changes (no flicker)
   static uint32_t drawnData = 0;
@@ -2043,7 +2050,7 @@ void screenTargetIntel(bool newPage) {
     card(20, 80, 280, 80);
     drawPlaneGlyph(160, 108, 14, -90, C_EDGE);
     tft.setFreeFont(&FreeSans9pt7b); tft.setTextColor(C_SOFT, C_PANEL); tft.setTextDatum(TC_DATUM);
-    tft.drawString("No aircraft in range", 160, 128);
+    tft.drawString(heliOnly ? "No helicopters in range" : "No aircraft in range", 160, 128);
     tft.setTextDatum(TL_DATUM); tft.setTextFont(2);
     return;
   }
@@ -2145,7 +2152,7 @@ void screenTargetIntel(bool newPage) {
 const int TR_Y = 29, TR_H = 38, TR_STEP = 42;
 
 void screenTop5(bool newPage) {
-  drawHeader("TRAFFIC NEAR YOU", newPage);
+  drawHeader(heliOnly ? "HELICOPTERS NEAR YOU" : "TRAFFIC NEAR YOU", newPage);
 
   const Aircraft* ap = targetAircraft();
   static uint32_t drawnData = 0;
@@ -2159,7 +2166,7 @@ void screenTop5(bool newPage) {
   if (top5Count == 0) {
     card(10, 82, 300, 80);
     tft.setFreeFont(&FreeSans9pt7b); tft.setTextColor(C_TEXT, C_PANEL); tft.setTextDatum(MC_DATUM);
-    tft.drawString("No aircraft in range", 160, 112);
+    tft.drawString(heliOnly ? "No helicopters in range" : "No aircraft in range", 160, 112);
     tft.setTextFont(1); tft.setTextColor(C_SOFT, C_PANEL);
     tft.drawString("Traffic will appear here when detected", 160, 138);
     tft.setTextDatum(TL_DATUM); tft.setTextFont(2);
@@ -2220,7 +2227,7 @@ void drawRangeButtons(float current) {
 }
 
 void screenRadar(bool newPage) {
-  drawHeader("RADAR PPI", newPage);
+  drawHeader(heliOnly ? "RADAR - HELICOPTERS" : "RADAR PPI", newPage);
 
   double hLat, hLon; float rRange;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
@@ -3779,6 +3786,8 @@ void initWebServer() {
   <input id="smi" maxlength="4" placeholder="e.g. KORD" value=")rawliteral" + String(sc.metarIcao) + R"rawliteral(" style="text-transform:uppercase">
   <label>"No aircraft nearby" means none within ()rawliteral" + String(DIST_UNIT) + R"rawliteral()</label>
   <input type="number" step="1" min="1" max="100" id="sir" value=")rawliteral" + String((int)sc.idleRange) + R"rawliteral(">
+  <label class="chk"><input type="checkbox" id="sho")rawliteral" + chk(heliOnly) + R"rawliteral(> Helicopters only (radar, traffic and nearest show only helicopters)</label>
+  <div class="hint sub">Alerts, notifications, emergencies, today's log and the collection still see all aircraft.</div>
   <label class="chk"><input type="checkbox" id="seb")rawliteral" + chk(emergencyBanner) + R"rawliteral(> Red banner for emergency squawks (7500 / 7600 / 7700)</label>
   <button type="button" onclick="saveScreens()">Save screens</button>
 </div>
@@ -3958,7 +3967,7 @@ function saveClock(){
 function saveScreens(){
   var b=function(i){return $(i).checked?1:0};
   post('/screens','ro='+b('sro')+'&rs='+$('srs').value+
-    '&ms='+$('sms').value+'&mi='+encodeURIComponent($('smi').value.trim().toUpperCase())+'&ir='+$('sir').value+'&eb='+b('seb'),
+    '&ms='+$('sms').value+'&mi='+encodeURIComponent($('smi').value.trim().toUpperCase())+'&ir='+$('sir').value+'&eb='+b('seb')+'&ho='+b('sho'),
     function(x){flash(x.status==200?'✓ Screens saved!':x.responseText)});
 }
 var colRows=[];
@@ -4228,6 +4237,9 @@ function forget(){
     scr = c;
     if (configMutex) xSemaphoreGive(configMutex);
     emergencyBanner = server.arg("eb") == "1";
+    bool ho = server.arg("ho") == "1";
+    if (ho != heliOnly) { heliOnly = ho; refreshRequested = true; }   // refilter right away
+    prefs.putBool("heli_only", heliOnly);
     prefs.putBool("rot_on", c.rotate); prefs.putUShort("rot_sec", c.rotateSec);
     prefs.putUChar("mtr_show", c.metarShow); prefs.putString("mtr_icao", c.metarIcao); prefs.putFloat("idle_rng", c.idleRange);
     prefs.putBool("emg_on", emergencyBanner);
@@ -4514,6 +4526,7 @@ void setup() {
   if (prefs.isKey("mtr_icao")) copyAscii(scr.metarIcao, prefs.getString("mtr_icao").c_str(), sizeof(scr.metarIcao));
   PREF("idle_rng", getFloat, scr.idleRange);
   PREF("emg_on", getBool, emergencyBanner);
+  PREF("heli_only", getBool, heliOnly);
   PREF("mirror", getBool, screenMirror);
   PREF("col_start", getUInt, colStart);
   // Notification kinds added in 1.5 are on by default for existing setups too
