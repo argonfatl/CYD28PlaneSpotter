@@ -14,7 +14,7 @@ A real-time aircraft tracker for the **ESP32 Cheap Yellow Display (CYD)** that r
 
 - **Nearest aircraft** — a flight card for the nearest (or a tapped) aircraft: callsign and flight number, airline, aircraft model and registration, route with city names and a progress bar, altitude, speed, distance/bearing and climb/descent rate.
 - **Traffic** — the 5 closest flights with route, altitude and distance; tap a row to open its flight card.
-- **Radar PPI** — rotating sweep with blips for the 20 nearest aircraft (callsign, altitude, speed) and range presets on the left.
+- **Radar PPI** — rotating sweep with up to 40 aircraft spread over the whole range (callsign, altitude, speed) and range presets on the left; picking a wider range widens the data query to match.
 - **Weather & System** — temperature, conditions, humidity, wind and pressure from Open-Meteo, plus WiFi signal, memory, active data source and request counters.
 - **Settings menu** — WiFi setup, locate by IP, touch calibration, screen brightness, LED alerts on/off and arrow navigation, opened by tapping the clock / WiFi icon.
 - **WiFi setup portal** — no credentials in code needed: on first boot (or when the saved network is unreachable) the device opens a `PlaneSpotter-Setup` hotspot and shows a QR code: scan it with the phone camera to join, then pick your network and enter your city on the page that opens.

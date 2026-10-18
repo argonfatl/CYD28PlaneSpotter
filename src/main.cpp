@@ -236,8 +236,8 @@ const uint8_t MAX_TOP5 = 5;
 Aircraft top5[MAX_TOP5];
 uint8_t top5Count = 0;
 
-// Blips for Radar (the MAX_BLIPS nearest aircraft)
-struct Blip { double lat; double lon; float track; float speedKt; char callsign[10]; int altFt; double distKm; char hex[8]; bool heli; };
+// Blips for Radar (up to MAX_BLIPS inside the radar range, spread over distance rings)
+struct Blip { double lat; double lon; float track; float speedKt; char callsign[10]; int altFt; double distKm; char hex[8]; bool heli; uint8_t ring; };
 
 // Emergency squawk (7500 / 7600 / 7700 or a readsb emergency state) anywhere in the search area
 struct Emergency {
@@ -258,7 +258,7 @@ volatile bool selectRequested = false;   // poll now to fill in the details
 // Radar trails: last positions of the aircraft on the radar
 const int TRAIL_PTS = 8;
 struct Trail { char hex[8]; uint8_t n; float lat[TRAIL_PTS], lon[TRAIL_PTS]; uint32_t seenMs; };
-Trail trails[24];                   // under dataMutex
+Trail trails[40];                   // under dataMutex
 
 // Extra screens and page rotation (web page "Screens" card)
 enum { SHOW_OFF, SHOW_PAGE, SHOW_IDLE };
@@ -278,7 +278,7 @@ struct Metar {
   char raw[168] = "";
 } metar;                            // under dataMutex
 char metarErr[48] = "";
-const uint8_t MAX_BLIPS = 20;
+const uint8_t MAX_BLIPS = 40;
 Blip blips[MAX_BLIPS];
 uint8_t blipCount = 0;
 uint32_t lastDataMs = 0;
@@ -850,6 +850,73 @@ AlertKind classifyAlert(const LedConfig& lc, const WatchList& wl, const char* cs
 }
 
 // ---------------------------------------------------------------------------
+// Aircraft list download: stream the readsb JSON and hand over one aircraft at a time
+// ---------------------------------------------------------------------------
+bool findAircraftArray(Stream& st) {
+  char last[12] = ""; char c;
+  while (st.readBytes(&c, 1) == 1) {
+    memmove(last, last + 1, 10); last[10] = c; last[11] = '\0';
+    if (strcmp(last + 7, "\"ac\"") == 0 || strcmp(last + 1, "\"aircraft\"") == 0) {
+      while (st.readBytes(&c, 1) == 1) {
+        if (c == '[') return true;
+        if (c != ' ' && c != ':' && c != '\n' && c != '\r' && c != '\t') break;
+      }
+    }
+  }
+  return false;
+}
+
+template <typename F>
+int streamAircraft(const String& url, JsonDocument& filter, F onAircraft, char* err, size_t errLen) {
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient https;
+  https.setReuse(false);
+  https.useHTTP10(true);
+  https.setTimeout(15000);
+  https.setUserAgent("CYD28PlaneSpotter/1.2 (+https://github.com/argonfatl/CYD28PlaneSpotter)");
+  if (!https.begin(client, url)) { snprintf(err, errLen, "begin failed"); return -1; }
+  int code = https.GET();
+  if (code != HTTP_CODE_OK) {
+    if (code < 0) {
+      char tls[64] = "";
+      if (client.lastError(tls, sizeof(tls)) == 0) tls[0] = '\0';
+      Serial.printf("HTTP error %d (%s) [%s] heap %u max block %u: %s\n", code, https.errorToString(code).c_str(), tls,
+                    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(), url.c_str());
+      if (tls[0]) snprintf(err, errLen, "TLS: %s", tls); else snprintf(err, errLen, "%s", https.errorToString(code).c_str());
+    } else snprintf(err, errLen, "HTTP %d", code);
+    https.end();
+    return code;
+  }
+  Stream& st = https.getStream();
+  st.setTimeout(15000);
+  if (!findAircraftArray(st)) { snprintf(err, errLen, "no aircraft list"); https.end(); return -3; }
+  int n = 0; char c;
+  auto peekWait = [&]() {                  // peek() doesn't wait for data to arrive
+    uint32_t t0 = millis();
+    while (!st.available() && millis() - t0 < 15000) delay(2);
+    return st.peek();
+  };
+  while (true) {
+    // Empty list, or the end after the last element
+    while (peekWait() == ' ' || st.peek() == '\n' || st.peek() == '\r' || st.peek() == '\t') st.read();
+    if (st.peek() == ']') break;
+    JsonDocument el;
+    DeserializationError e = deserializeJson(el, st, DeserializationOption::Filter(filter));
+    if (e) {
+      if (n == 0) { snprintf(err, errLen, "JSON %s", e.c_str()); https.end(); return -2; }
+      Serial.printf("Aircraft list cut short after %d (%s)\n", n, e.c_str());
+      break;
+    }
+    onAircraft(el.as<JsonObject>());
+    n++;
+    do { if (st.readBytes(&c, 1) != 1) c = ']'; } while (c == ' ' || c == '\n' || c == '\r' || c == '\t');
+    if (c != ',') break;
+  }
+  https.end();
+  return HTTP_CODE_OK;
+}
+
+// ---------------------------------------------------------------------------
 // Today's log: unique aircraft per hour, records and notable sightings.
 // Reset at local midnight; kept in RAM (starts over after a restart).
 // ---------------------------------------------------------------------------
@@ -1026,56 +1093,35 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
   strcpy(selHex, (selectedUntil && (int32_t)(selectedUntil - millis()) > 0) ? selectedHex : "");
   if (dataMutex) xSemaphoreGive(dataMutex);
 
-  // Keep only the fields we use — near a big airport the raw payload is large.
-  // The sources use the same readsb format; the array is "ac" (some use "aircraft").
+  // Query area: the configured search radius, widened to the radar range when that is larger
+  float rRange;
+  if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
+  rRange = radarRange;
+  if (configMutex) xSemaphoreGive(configMutex);
+  double radarKm = rRange * KM_PER_UNIT, searchKm = sRadNm * 1.852;
+  float queryNm = max(sRadNm, (float)(radarKm / 1.852));
+  if (queryNm > MAX_SEARCH_NM) queryNm = MAX_SEARCH_NM;
+
+  // Only the fields we use; the aircraft are parsed one at a time from the stream,
+  // so even a few hundred aircraft need just one small document at a time
   JsonDocument filter;
-  for (const char* key : {"ac", "aircraft"}) {
-    JsonObject f = filter[key].add<JsonObject>();
-    for (const char* fld : {"hex", "flight", "r", "t", "lat", "lon", "alt_baro", "alt_geom", "gs",
-                            "track", "baro_rate", "geom_rate", "category", "dbFlags", "squawk", "emergency"})
-      f[fld] = true;
-  }
-
-  // Try the last source that worked first, then the others
-  JsonDocument doc;
-  bool ok = false;
-  int start = activeSource;
-  for (int k = 0; k < NUM_SOURCES && !ok; k++) {
-    int i = (start + k) % NUM_SOURCES;
-    String url = sourceUrl(i, hLat, hLon, (int)ceilf(sRadNm));
-    char err[72] = "";
-    doc.clear();
-    if (httpGetJson(url, doc, &filter, err, sizeof(err)) == HTTP_CODE_OK) {
-      ok = true;
-      activeSource = i;
-      lastOkMs = millis();
-    } else {
-      snprintf(lastFetchErr, sizeof(lastFetchErr), "%s: %s", SOURCES[i].name, err);
-      Serial.printf("Aircraft source %s failed: %s\n", SOURCES[i].name, err);
-    }
-  }
-  if (!ok) { stats.requestsFail++; return false; }
-
-  JsonArray acList = doc["ac"].is<JsonArray>() ? doc["ac"].as<JsonArray>() : doc["aircraft"].as<JsonArray>();
+  for (const char* fld : {"hex", "flight", "r", "t", "lat", "lon", "alt_baro", "alt_geom", "gs",
+                          "track", "baro_rate", "geom_rate", "category", "dbFlags", "squawk", "emergency"})
+    filter[fld] = true;
 
   uint16_t count = 0;
-  blipCntOut = 0;
-  top5CntOut = 0;
-
   NotifyConfig nc;
   if (configMutex) xSemaphoreTake(configMutex, portMAX_DELAY);
   nc = notifyCfg;
   if (configMutex) xSemaphoreGive(configMutex);
   WatchList noWatch;
-  notifyCandN = 0;
-
   bool logging = logMutex && logBegin();
-  if (logging) xSemaphoreTake(logMutex, portMAX_DELAY);
-  for (JsonObject s : acList) {
-    if (!s["lat"].is<double>() || !s["lon"].is<double>()) continue;
+
+  auto onAircraft = [&](JsonObject s) {
+    if (!s["lat"].is<double>() || !s["lon"].is<double>()) return;
 
     // Skip aircraft on the ground (alt_baro == "ground") — only track those in flight
-    if (s["alt_baro"].is<const char*>()) continue;
+    if (s["alt_baro"].is<const char*>()) return;
 
     double lat = s["lat"].as<double>(), lon = s["lon"].as<double>();
     double d = haversineKm(hLat, hLon, lat, lon);
@@ -1091,6 +1137,7 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     copyAscii(category, s["category"] | "", sizeof(category));
     uint8_t dbFlags = s["dbFlags"] | 0;
     count++;
+    bool inSearch = d <= searchKm;     // log, collection and emergencies use the configured area
 
     // Emergency: squawk 7500/7600/7700 or a readsb emergency state
     const char* sq = s["squawk"] | "";
@@ -1105,15 +1152,21 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
     else if (!strcmp(em, "nordo")) what = "RADIO FAILURE";
     else if (!strcmp(em, "unlawful")) what = "HIJACK";
     else if (!strcmp(em, "downed")) what = "DOWNED";
-    if (what && (!emOut.on || d < emOut.km)) {
+    if (what && inSearch && (!emOut.on || d < emOut.km)) {
       emOut.on = true; emOut.km = d; emOut.brg = brg; emOut.alt = altFt;
       copyAscii(emOut.cs, cs[0] ? cs : "?", sizeof(emOut.cs)); copyAscii(emOut.hex, s["hex"] | "", sizeof(emOut.hex));
       copyAscii(emOut.type, type, sizeof(emOut.type)); copyAscii(emOut.squawk, sq, sizeof(emOut.squawk));
       copyAscii(emOut.what, what, sizeof(emOut.what));
     }
 
-    if (logging) logAircraft(s["hex"] | "", cs, type, category, dbFlags, altFt, gsKt, d, wl, what != nullptr);
-    collectionConsider(type, s["hex"] | "", cs, s["r"] | "");
+    if (inSearch) {
+      if (logging) {
+        xSemaphoreTake(logMutex, portMAX_DELAY);
+        logAircraft(s["hex"] | "", cs, type, category, dbFlags, altFt, gsKt, d, wl, what != nullptr);
+        xSemaphoreGive(logMutex);
+      }
+      collectionConsider(type, s["hex"] | "", cs, s["r"] | "");
+    }
     if (nc.on && nc.topic[0])
       notifyConsider(nc, wl, noWatch, s["hex"] | "", cs, type, s["r"] | "", category, dbFlags, altFt, gsKt, d, brg);
 
@@ -1127,22 +1180,26 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
       }
     }
 
-    // Radar keeps the MAX_BLIPS nearest aircraft (replace the farthest when full)
-    int slot = -1;
-    if (blipCntOut < MAX_BLIPS) {
-      slot = blipCntOut++;
-    } else {
-      double farthest = d;
-      for (int i = 0; i < MAX_BLIPS; i++)
-        if (blipsOut[i].distKm > farthest) { farthest = blipsOut[i].distKm; slot = i; }
-    }
-    if (slot >= 0) {
-      Blip& b = blipsOut[slot];
-      b.lat = lat; b.lon = lon; b.track = track; b.speedKt = gsKt;
-      b.altFt = altFt; b.distKm = d;
-      strcpy(b.callsign, cs);
-      copyAscii(b.hex, s["hex"] | "", sizeof(b.hex));
-      b.heli = strcmp(category, "A7") == 0;
+    // Radar: up to MAX_BLIPS aircraft inside the radar range, spread over 4 distance rings
+    // (10 per ring, nearest first) so a wide range doesn't show only the centre
+    if (d <= radarKm) {
+      uint8_t ring = (uint8_t)min(3.0, d / radarKm * 4);
+      int inRing = 0, far = -1; double farD = -1;
+      for (int i = 0; i < blipCntOut; i++) if (blipsOut[i].ring == ring) {
+        inRing++;
+        if (blipsOut[i].distKm > farD) { farD = blipsOut[i].distKm; far = i; }
+      }
+      int slot = -1;
+      if (inRing < MAX_BLIPS / 4 && blipCntOut < MAX_BLIPS) slot = blipCntOut++;
+      else if (far >= 0 && d < farD) slot = far;
+      if (slot >= 0) {
+        Blip& b = blipsOut[slot];
+        b.lat = lat; b.lon = lon; b.track = track; b.speedKt = gsKt;
+        b.altFt = altFt; b.distKm = d; b.ring = ring;
+        strcpy(b.callsign, cs);
+        copyAscii(b.hex, s["hex"] | "", sizeof(b.hex));
+        b.heli = strcmp(category, "A7") == 0;
+      }
     }
 
     Aircraft a;
@@ -1172,9 +1229,28 @@ bool fetchAircraftTo(Aircraft* top5Out, uint8_t& top5CntOut,
       top5Out[insertIdx] = a;
       if (top5CntOut < MAX_TOP5) top5CntOut++;
     }
-  }
+  };
 
-  if (logging) xSemaphoreGive(logMutex);
+  // Try the last source that worked first, then the others
+  bool ok = false;
+  int start = activeSource;
+  for (int k = 0; k < NUM_SOURCES && !ok; k++) {
+    int i = (start + k) % NUM_SOURCES;
+    String url = sourceUrl(i, hLat, hLon, (int)ceilf(queryNm));
+    char err[72] = "";
+    count = 0; blipCntOut = 0; top5CntOut = 0; notifyCandN = 0;     // a failed source may have sent some
+    alertOut = AlertInfo(); emOut = Emergency(); selOut.valid = false;
+    if (streamAircraft(url, filter, onAircraft, err, sizeof(err)) == HTTP_CODE_OK) {
+      ok = true;
+      activeSource = i;
+      lastOkMs = millis();
+    } else {
+      snprintf(lastFetchErr, sizeof(lastFetchErr), "%s: %s", SOURCES[i].name, err);
+      Serial.printf("Aircraft source %s failed: %s\n", SOURCES[i].name, err);
+    }
+  }
+  if (!ok) { stats.requestsFail++; return false; }
+
   stats.inView = count; if (count > stats.maxInView) stats.maxInView = count;
   stats.requestsOk++;
 
@@ -1557,7 +1633,7 @@ void dataFetcherTask(void* param) {
           const Blip& b = locBlips[i];
           if (!b.hex[0]) continue;
           int t = -1, freeT = -1;
-          for (int j = 0; j < 24; j++) {
+          for (int j = 0; j < 40; j++) {
             if (trails[j].hex[0] && strcmp(trails[j].hex, b.hex) == 0) { t = j; break; }
             if (freeT < 0 && (!trails[j].hex[0] || millis() - trails[j].seenMs > 120000UL)) freeT = j;
           }
